@@ -133,7 +133,13 @@ function dist(ax, ay, bx, by) { return Math.sqrt(dist2(ax, ay, bx, by)); }
 /* --------------------------- 3. PLATFORM / SDK --------------------------- */
 
 const Platform = (function () {
-  const hasYt = typeof window.ytgame !== 'undefined';
+  // The real Playables SDK script defines window.ytgame unconditionally,
+  // even when this page is opened standalone (not inside YouTube's iframe).
+  // Only trust it when we're actually embedded, so local/LAN/iPhone test
+  // links reliably use our own localStorage-backed save + full-volume audio
+  // instead of routing through SDK calls that don't do anything useful
+  // outside the real Playables frame.
+  const hasYt = typeof window.ytgame !== 'undefined' && window.self !== window.top;
   let audioEnabled = true;
   let pauseCb = null, resumeCb = null, audioChangeCb = null;
 
@@ -296,6 +302,62 @@ const Audio_ = (function () {
     src.stop(t0 + dur + 0.02);
   }
 
+  // Continuous jet engine drone: a looping filtered-noise "air rush" plus a
+  // low sawtooth "turbine whine", both gain-automated in real time rather
+  // than re-triggered every frame -- boosting pushes the filter/pitch up
+  // and gets louder, matching the engine glow getting brighter on the jet.
+  let engineStarted = false;
+  let engineNoiseGain = null, engineFilter = null, engineOsc = null, engineOscGain = null;
+
+  function startEngine() {
+    if (!ctx || engineStarted) return;
+    engineStarted = true;
+
+    const bufSize = ctx.sampleRate; // 1s loop
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+    const noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = buf;
+    noiseSrc.loop = true;
+    engineFilter = ctx.createBiquadFilter();
+    engineFilter.type = 'bandpass';
+    engineFilter.frequency.value = 500;
+    engineFilter.Q.value = 0.9;
+    engineNoiseGain = ctx.createGain();
+    engineNoiseGain.gain.value = 0;
+    noiseSrc.connect(engineFilter);
+    engineFilter.connect(engineNoiseGain);
+    engineNoiseGain.connect(sfxGain);
+    noiseSrc.start();
+
+    engineOsc = ctx.createOscillator();
+    engineOsc.type = 'sawtooth';
+    engineOsc.frequency.value = 80;
+    engineOscGain = ctx.createGain();
+    engineOscGain.gain.value = 0;
+    engineOsc.connect(engineOscGain);
+    engineOscGain.connect(sfxGain);
+    engineOsc.start();
+  }
+
+  // Called every frame with the jet's current flight state -- ramps the
+  // engine smoothly rather than snapping, so it never clicks or pops.
+  function setEngine(flying, boosting) {
+    ensureCtx();
+    startEngine();
+    if (!ctx || !engineNoiseGain) return;
+    const t = ctx.currentTime;
+    const noiseTarget = !flying ? 0 : boosting ? 0.24 : 0.1;
+    const oscTarget = !flying ? 0 : boosting ? 0.1 : 0.035;
+    const filterTarget = boosting ? 950 : 480;
+    const pitchTarget = boosting ? 145 : 78;
+    engineNoiseGain.gain.setTargetAtTime(noiseTarget, t, 0.15);
+    engineOscGain.gain.setTargetAtTime(oscTarget, t, 0.15);
+    engineFilter.frequency.setTargetAtTime(filterTarget, t, 0.25);
+    engineOsc.frequency.setTargetAtTime(pitchTarget, t, 0.2);
+  }
+
   function startMusicLoop() {
     if (!ctx || musicTimer) return;
     const notes = [261.6, 293.7, 329.6, 392.0, 440.0, 392.0, 329.6, 293.7];
@@ -320,18 +382,36 @@ const Audio_ = (function () {
 
   return {
     unlock,
+    setEngine,
     setMusicOn(on) { save.musicOn = on; if (musicGain) musicGain.gain.value = on ? 0.22 : 0; },
     setSoundOn(on) { save.soundOn = on; if (sfxGain) sfxGain.gain.value = on ? 0.6 : 0; },
     bulletPickup() { ensureCtx(); tone(1200, 0.12, 'sine', 0.5, 0, 1800); },
     closeCall() { ensureCtx(); noiseBurst(0.25, 0.25, 0, 3000); },
     launch() { ensureCtx(); tone(180, 0.15, 'square', 0.3, 0, 340); },
-    boom() { ensureCtx(); noiseBurst(0.4, 0.6, 0, 900); tone(90, 0.4, 'sine', 0.4, 0, 40); },
+    boom() {
+      ensureCtx();
+      // Layered explosion: a sharp crack, a punchy noise body, a dropping
+      // bass thump (+ sub for weight), and a quiet crackling debris tail --
+      // pitch is jittered a little each time so repeated explosions don't
+      // all sound identical.
+      const j = rand(0.9, 1.1);
+      noiseBurst(0.05, 0.45, 0, 6500);
+      noiseBurst(0.32, 0.65, 0.01, 1100);
+      tone(190 * j, 0.32, 'sine', 0.5, 0, 35);
+      tone(95 * j, 0.5, 'triangle', 0.3, 0.02, 25);
+      noiseBurst(0.3, 0.16, 0.09, 2400);
+    },
     click() { ensureCtx(); tone(700, 0.05, 'square', 0.25); },
-    powerup() { ensureCtx(); tone(500, 0.2, 'triangle', 0.35, 0, 1200); },
     denied() { ensureCtx(); tone(160, 0.1, 'square', 0.2, 0, 90); },
     refuel() { ensureCtx(); tone(300, 0.18, 'sine', 0.4, 0, 700); tone(450, 0.14, 'sine', 0.3, 0.08, 900); },
     lowFuel() { ensureCtx(); tone(220, 0.15, 'square', 0.25, 0); tone(220, 0.15, 'square', 0.25, 0.2); },
     flareBurst() { ensureCtx(); noiseBurst(0.5, 0.7, 0, 1600); tone(140, 0.35, 'sawtooth', 0.4, 0, 45); },
+    // Each power-up now has its own activation sound instead of sharing one
+    // generic chime.
+    boostActivate() { ensureCtx(); tone(220, 0.3, 'sawtooth', 0.35, 0, 950); noiseBurst(0.2, 0.18, 0.02, 4200); },
+    shieldActivate() { ensureCtx(); tone(800, 0.12, 'sine', 0.3, 0, 1300); tone(1100, 0.16, 'sine', 0.28, 0.08, 1700); },
+    slowmoActivate() { ensureCtx(); tone(650, 0.5, 'sine', 0.32, 0, 140); tone(650, 0.35, 'sine', 0.18, 0.05, 160); },
+    empActivate() { ensureCtx(); tone(1400, 0.08, 'square', 0.3, 0, 60); noiseBurst(0.18, 0.35, 0.02, 5500); },
   };
 })();
 
@@ -747,21 +827,24 @@ function activatePowerup(id) {
     return;
   }
   save.bullets -= POWERUPS[id].cost;
-  Audio_.powerup();
   switch (id) {
     case 'boost':
       jet.boostTimer = JET_BOOST_DURATION;
+      Audio_.boostActivate();
       break;
     case 'flares':
-      activateFlareStrike();
+      activateFlareStrike(); // plays its own flareBurst() sound
       break;
     case 'shield':
       jet.shieldTimer = SHIELD_DURATION;
+      Audio_.shieldActivate();
       break;
     case 'slowmo':
       jet.slowmoTimer = SLOWMO_DURATION;
+      Audio_.slowmoActivate();
       break;
     case 'emp': {
+      Audio_.empActivate();
       const list = missilePool.active.slice();
       for (const m of list) destroyMissile(m, true);
       spawnShockwave(jet.x, jet.y);
@@ -802,6 +885,10 @@ function update(dtRaw) {
   if (Game.state === 'hint') {
     Game.startHintAlpha = Math.max(0, Game.startHintAlpha - dt / 2.5);
   }
+
+  // Continuous engine hum -- runs (or fades out) every frame regardless of
+  // state, since it's a smooth gain ramp, not a one-shot trigger.
+  Audio_.setEngine(Game.state === 'playing', Game.state === 'playing' && jet.boostTimer > 0);
 
   // Missiles (and their trails/collisions) keep simulating for a moment after
   // death -- only the jet itself and scoring freeze immediately.
@@ -1788,6 +1875,20 @@ function drawFuelGauge(cx, cy, w, h) {
   drawShadowedText('FUEL', cx, cy + 1, Math.round(h * 0.5), COLORS.white, 'rgba(5,11,31,0.6)', 1);
 }
 
+// A clear red diagonal slash over a HUD icon so "muted" is unmistakable at
+// a glance, not just a subtle dimming.
+function drawMuteSlash(x, y, r) {
+  ctx2d.save();
+  ctx2d.strokeStyle = '#E4453A';
+  ctx2d.lineWidth = 3;
+  ctx2d.lineCap = 'round';
+  ctx2d.beginPath();
+  ctx2d.moveTo(x - r * 0.55, y - r * 0.55);
+  ctx2d.lineTo(x + r * 0.55, y + r * 0.55);
+  ctx2d.stroke();
+  ctx2d.restore();
+}
+
 function drawHudButtons() {
   drawWoodButton(hudButtons[0].x, hudButtons[0].y, hudButtons[0].r, (x, y) => {
     ctx2d.fillStyle = COLORS.woodIcon;
@@ -1810,6 +1911,7 @@ function drawHudButtons() {
   drawWoodButton(hudButtons[1].x, hudButtons[1].y, hudButtons[1].r, (x, y) => {
     ctx2d.fillStyle = save.musicOn ? COLORS.woodIcon : 'rgba(247,233,203,0.4)';
     drawUprightText('♪', x, y + 1, 18, ctx2d.fillStyle, 'center', true);
+    if (!save.musicOn) drawMuteSlash(x, y, hudButtons[1].r);
   });
   drawWoodButton(hudButtons[2].x, hudButtons[2].y, hudButtons[2].r, (x, y) => {
     // speaker: a rounded pennant-like silhouette
@@ -1824,6 +1926,8 @@ function drawHudButtons() {
       ctx2d.beginPath();
       ctx2d.arc(x + 6, y, 5, -0.6, 0.6);
       ctx2d.stroke();
+    } else {
+      drawMuteSlash(x, y, hudButtons[2].r);
     }
   });
 
