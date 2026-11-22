@@ -7,8 +7,14 @@
 
 /* ----------------------------- 1. CONFIG -------------------------------- */
 
-const LOGICAL_W = 390;
-const LOGICAL_H = 845;
+// Gameplay is tuned for a 390x845 portrait view. The visible view (VIEW_W x
+// VIEW_H) follows the window's shape but keeps about the same area, so no
+// aspect ratio sees much more or less of the world than a phone does.
+const BASE_W = 390;
+const BASE_H = 845;
+const BASE_DIAG = Math.hypot(BASE_W, BASE_H);
+let VIEW_W = BASE_W;
+let VIEW_H = BASE_H;
 
 const JET_SPEED = 260;              // px/s, forward speed
 const JET_TURN_RATE = 3.5;          // rad/s
@@ -24,10 +30,18 @@ const MISSILE_RADIUS = 6;
 const MISSILE_LIFETIME_MIN = 9;
 const MISSILE_LIFETIME_MAX = 11;
 const MISSILE_SPAWN_FRONT_EXCLUDE = 30 * Math.PI / 180;
+// Rocket motors burn for most of the flight, then the missile coasts and bleeds speed.
+const MISSILE_COAST_TIME = 2.2;
+const MISSILE_COAST_SPEED_MIN = 0.7;
+// Radar-guided (AMRAAM-style): bigger and less agile, but leads its target and ignores flares.
+const RADAR_SPEED_MULT = 1.06;
+const RADAR_TURN_RATE = 1.55;
+const RADAR_LEAD = 0.55;           // fraction of the jet's predicted travel it aims ahead
+const RADAR_LEAD_MAX_T = 1.5;      // s, cap on time-to-go used for the lead point
 
 const BULLET_RADIUS = 14;
 const BULLET_COUNT_TARGET = 9;
-const BULLET_SPAWN_RANGE = LOGICAL_W * 1.2; // ~1.5 "screens" worth of radius
+const BULLET_SPAWN_RANGE = BASE_W * 1.2; // ~1.5 "screens" worth of radius
 const BULLET_DESPAWN_DIST = BULLET_SPAWN_RANGE * 1.6;
 
 const FUEL_MAX = 100;
@@ -35,17 +49,36 @@ const FUEL_DRAIN_RATE = 5.5;       // fuel units/s -- empties a full tank in ~18
 const FUEL_CAN_REFILL = 35;
 const FUEL_CAN_RADIUS = 13;
 const FUEL_CAN_COUNT_TARGET = 4;   // scarcer than bullets -- fuel is the precious resource
-const FUEL_CAN_SPAWN_RANGE = LOGICAL_W * 1.4;
+const FUEL_CAN_SPAWN_RANGE = BASE_W * 1.4;
 const FUEL_CAN_DESPAWN_DIST = FUEL_CAN_SPAWN_RANGE * 1.6;
 const FUEL_LOW_THRESHOLD = 0.25;
 
 const CLOSE_CALL_DIST = 38;
 const CLOSE_CALL_RESET_DIST = 90;
 
-const MAX_MISSILES_START = 1;
-const MISSILE_CAP_INCREASE_INTERVAL = 12; // seconds
-const MISSILE_CAP_MAX = 6;
 const FIRST_MISSILE_DELAY = 1.5;
+
+// A new level every LEVEL_DURATION seconds; past the table, every 2 levels add a missile.
+const LEVEL_DURATION = 15;
+const LEVELS = [
+  { cap: 1, radar: 0 },
+  { cap: 2, radar: 0 },
+  { cap: 3, radar: 0 },
+  { cap: 3, radar: 0.3, msg: "Radar missiles! Flares can't fool them" },
+  { cap: 4, radar: 0.3 },
+  { cap: 5, radar: 0.35 },
+  { cap: 5, radar: 0.4 },
+  { cap: 6, radar: 0.45 },
+];
+const MISSILE_CAP_MAX = 8;
+const SCORE_LEVEL_UP = 10;          // x level number
+
+function levelConfig(level) {
+  const base = LEVELS[Math.min(level, LEVELS.length) - 1];
+  if (level <= LEVELS.length) return base;
+  const extra = Math.floor((level - LEVELS.length) / 2);
+  return { cap: Math.min(MISSILE_CAP_MAX, base.cap + extra), radar: 0.5 };
+}
 
 const SCORE_PER_SECOND = 1;
 const SCORE_BULLET = 10;
@@ -63,11 +96,19 @@ const SHIELD_DURATION = 5;
 const SLOWMO_DURATION = 3;
 const SLOWMO_FACTOR = 0.4;
 const FLARE_FLASH_DURATION = 0.2;
-const FLARE_INTERCEPTOR_COUNT = 2;
-const INTERCEPTOR_SPEED = 620;      // px/s -- faster than any missile so it can catch up
-const INTERCEPTOR_TURN_RATE = 4.5;  // rad/s -- sharper than a missile's turn so it can correct
-const INTERCEPTOR_RADIUS = 5;
-const INTERCEPTOR_LIFETIME = 3.5;   // fizzles out if it never catches its target
+// IR decoy flares: ejected in pairs from both sides, they out-burn the jet's
+// exhaust, so a heat-seeker that sees one in its seeker cone may switch to it.
+const FLARE_PAIRS = 3;
+const FLARE_PAIR_INTERVAL = 0.14;   // s between pairs, like a dispenser program
+const FLARE_BURN_TIME = 3.2;        // s
+const FLARE_DRAG = 2.4;             // velocity decay per second
+const FLARE_PROXIMITY = 14;         // missile proximity fuse vs a flare
+const SEEKER_HALF_ANGLE = 40 * Math.PI / 180;
+const SEEKER_RANGE = 300;
+const DECOY_CHANCE_START = 0.9;     // early missiles are easily fooled
+const DECOY_CHANCE_END = 0.6;       // later seekers have better flare rejection
+const DECOY_BREAK_BONUS = 0.12;     // turning hard while dropping flares helps
+const MISSILE_LOST_LOCK_TIME = 0.9; // s a decoyed missile flies blind after its flare dies
 
 const COLORS = {
   skyTop: '#050B1F',
@@ -82,7 +123,6 @@ const COLORS = {
   jetCockpit: '#15181C',
   jetRim: 'rgba(225,230,235,0.6)',
   jetShadow: 'rgba(20,25,32,0.4)',
-  missileBody: '#FF7A52',
   starTwinkle: 'rgba(255,255,255,0.9)',
   orangeLight: '#FFB35C',
   orangeShadow: '#C96A16',
@@ -221,39 +261,245 @@ function migrateSave(raw) {
 let save = defaultSave();
 
 /* ------------------------------ 4. AUDIO --------------------------------- */
+// Everything is synthesized with Web Audio (no audio files). Signal flow:
+// voices -> [per-sound pan/distance] -> sfx or music bus -> master -> compressor
+// -> speakers. The compressor keeps stacked explosions from clipping.
+
+const MUSIC_VOL = 0.3; // sits ~8 dB under the effects so warnings always cut through
+const SFX_VOL = 0.85;
+const WARN_RANGE = 320; // missile-approach warning starts beeping inside this distance
 
 const Audio_ = (function () {
   let ctx = null;
   let master = null;
   let musicGain = null;
   let sfxGain = null;
+  let noiseBuf = null;
   let unlocked = false;
-  let musicTimer = null;
-  let musicStep = 0;
+  const lastPlayed = {};
 
   function ensureCtx() {
     if (ctx) return;
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return;
     ctx = new AC();
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -16;
+    comp.knee.value = 10;
+    comp.ratio.value = 5;
+    comp.attack.value = 0.003;
+    comp.release.value = 0.25;
+    comp.connect(ctx.destination);
     master = ctx.createGain();
-    master.gain.value = 1;
-    master.connect(ctx.destination);
+    master.connect(comp);
     musicGain = ctx.createGain();
-    musicGain.gain.value = save.musicOn ? 0.22 : 0;
+    musicGain.gain.value = save.musicOn ? MUSIC_VOL : 0;
     musicGain.connect(master);
     sfxGain = ctx.createGain();
-    sfxGain.gain.value = save.soundOn ? 0.6 : 0;
+    sfxGain.gain.value = save.soundOn ? SFX_VOL : 0;
     sfxGain.connect(master);
+    // One shared noise buffer; each voice starts at a random offset so no two sound alike.
+    noiseBuf = ctx.createBuffer(1, ctx.sampleRate * 2, ctx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
     applyMasterGate();
   }
 
+  function ready() { ensureCtx(); return !!ctx; }
+
   function applyMasterGate() {
-    if (!master) return;
-    master.gain.value = Platform.isAudioEnabled() ? 1 : 0;
+    if (master) master.gain.value = Platform.isAudioEnabled() ? 1 : 0;
+  }
+  Platform.onAudioEnabledChange(() => applyMasterGate());
+
+  // Voice limiting: the same sound can't retrigger faster than minGap seconds.
+  function allow(key, minGap) {
+    const t = ctx.currentTime;
+    if (lastPlayed[key] !== undefined && t - lastPlayed[key] < minGap) return false;
+    lastPlayed[key] = t;
+    return true;
   }
 
-  Platform.onAudioEnabledChange(() => applyMasterGate());
+  // Destination for a sound at world (x, y): panned by screen side, quieter with distance.
+  function at(x, y) {
+    if (x === undefined) return sfxGain;
+    const g = ctx.createGain();
+    g.gain.value = clamp(1.15 - Math.hypot(x - camera.x, y - camera.y) / 800, 0.12, 1);
+    if (ctx.createStereoPanner) {
+      const p = ctx.createStereoPanner();
+      p.pan.value = clamp((x - camera.x) / (VIEW_W * 0.6), -0.8, 0.8);
+      g.connect(p);
+      p.connect(sfxGain);
+    } else {
+      g.connect(sfxGain);
+    }
+    return g;
+  }
+
+  function osc(type, freq, t0, dur, peak, dest, opt = {}) {
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if (opt.detune) o.detune.value = opt.detune;
+    if (opt.glide) o.frequency.exponentialRampToValueAtTime(Math.max(20, opt.glide), t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + (opt.attack || 0.005));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    let tail = o;
+    if (opt.lowpass) {
+      const f = ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.value = opt.lowpass;
+      o.connect(f);
+      tail = f;
+    }
+    tail.connect(g);
+    g.connect(dest);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
+  }
+
+  function noise(t0, dur, peak, dest, opt = {}) {
+    const s = ctx.createBufferSource();
+    s.buffer = noiseBuf;
+    const f = ctx.createBiquadFilter();
+    f.type = opt.type || 'lowpass';
+    f.frequency.setValueAtTime(opt.freq || 2000, t0);
+    f.Q.value = opt.q || 0.7;
+    if (opt.sweepTo) f.frequency.exponentialRampToValueAtTime(opt.sweepTo, t0 + dur);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + (opt.attack || 0.003));
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    s.connect(f);
+    f.connect(g);
+    g.connect(dest);
+    s.start(t0, Math.random() * Math.max(0, noiseBuf.duration - dur - 0.1), dur + 0.05);
+  }
+
+  const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
+
+  /* ---- Engine: turbine whine (two detuned saws, low-passed, with a slow wobble) + air rush ---- */
+  let engine = null;
+  function startEngine() {
+    if (!ctx || engine) return;
+    const rush = ctx.createBufferSource();
+    rush.buffer = noiseBuf;
+    rush.loop = true;
+    const rushFilter = ctx.createBiquadFilter();
+    rushFilter.type = 'bandpass';
+    rushFilter.frequency.value = 500;
+    rushFilter.Q.value = 0.9;
+    const rushGain = ctx.createGain();
+    rushGain.gain.value = 0;
+    rush.connect(rushFilter);
+    rushFilter.connect(rushGain);
+    rushGain.connect(sfxGain);
+    rush.start();
+
+    const whineFilter = ctx.createBiquadFilter();
+    whineFilter.type = 'lowpass';
+    whineFilter.frequency.value = 650;
+    const whineGain = ctx.createGain();
+    whineGain.gain.value = 0;
+    const saws = [0, 9].map((cents) => {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = 78;
+      o.detune.value = cents;
+      o.connect(whineFilter);
+      o.start();
+      return o;
+    });
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 5.5;
+    const lfoDepth = ctx.createGain();
+    lfoDepth.gain.value = 45;
+    lfo.connect(lfoDepth);
+    lfoDepth.connect(whineFilter.frequency);
+    lfo.start();
+    whineFilter.connect(whineGain);
+    whineGain.connect(sfxGain);
+    engine = { rushGain, rushFilter, whineGain, whineFilter, saws };
+  }
+
+  function setEngine(flying, boosting) {
+    if (!ctx || !unlocked) return;
+    startEngine();
+    const t = ctx.currentTime;
+    engine.rushGain.gain.setTargetAtTime(!flying ? 0 : boosting ? 0.26 : 0.1, t, 0.15);
+    engine.whineGain.gain.setTargetAtTime(!flying ? 0 : boosting ? 0.13 : 0.06, t, 0.15);
+    engine.rushFilter.frequency.setTargetAtTime(boosting ? 1100 : 480, t, 0.25);
+    engine.whineFilter.frequency.setTargetAtTime(boosting ? 1300 : 650, t, 0.25);
+    for (const o of engine.saws) o.frequency.setTargetAtTime(boosting ? 140 : 78, t, 0.2);
+  }
+
+  /* ---- Adaptive music: Am-F-C-G at 104 BPM; layers join as the level rises ---- */
+  const STEP = 60 / 104 / 4; // one 16th note
+  const CHORDS = [[57, 60, 64], [53, 57, 60], [48, 52, 55], [55, 59, 62]];
+  let musicTimer = null, nextStepTime = 0, step = 0;
+
+  function musicLayers() {
+    return Game.state === 'playing' ? Math.min(4, Game.level) : 0;
+  }
+
+  function pad(chord, t, dur) {
+    const f = ctx.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.value = 900;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.05, t + 0.6);
+    g.gain.setValueAtTime(0.05, t + dur - 0.4);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.2);
+    f.connect(g);
+    g.connect(musicGain);
+    for (const n of chord) {
+      for (const cents of [-7, 7]) {
+        const o = ctx.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.value = mtof(n);
+        o.detune.value = cents;
+        o.connect(f);
+        o.start(t);
+        o.stop(t + dur + 0.3);
+      }
+    }
+  }
+
+  function scheduleStep(s, t) {
+    const pos = s % 16;
+    const chord = CHORDS[Math.floor(s / 16) % CHORDS.length];
+    const layers = musicLayers();
+    if (pos === 0) pad(chord, t, STEP * 16);
+    if (pos % 4 === 0 || (layers >= 2 && pos % 4 === 2)) {
+      osc('triangle', mtof(chord[0] - 12), t, STEP * (layers >= 2 ? 1.8 : 3.5), 0.2, musicGain, { attack: 0.01, lowpass: 600 });
+    }
+    if (layers >= 1 && pos % 8 === 0) osc('sine', 150, t, 0.25, 0.45, musicGain, { glide: 45 });
+    if (layers >= 2 && pos % 2 === 0) osc('triangle', mtof(chord[(pos / 2) % 3] + 12), t, 0.12, 0.06, musicGain);
+    if (layers >= 3 && pos % 4 === 2) noise(t, 0.04, 0.07, musicGain, { type: 'highpass', freq: 7000 });
+    if (layers >= 4 && (pos === 4 || pos === 12)) {
+      noise(t, 0.15, 0.16, musicGain, { type: 'bandpass', freq: 1800, q: 0.8 });
+      osc('triangle', 190, t, 0.08, 0.1, musicGain);
+    }
+  }
+
+  // Look-ahead scheduler: a coarse timer queues notes on the audio clock, so timing
+  // stays tight, and nothing piles up while the context is suspended.
+  function startMusicLoop() {
+    if (!ctx || musicTimer) return;
+    nextStepTime = ctx.currentTime + 0.1;
+    musicTimer = setInterval(() => {
+      if (!ctx || ctx.state !== 'running' || !save.musicOn) return;
+      if (nextStepTime < ctx.currentTime) nextStepTime = ctx.currentTime + 0.05;
+      while (nextStepTime < ctx.currentTime + 0.12) {
+        scheduleStep(step, nextStepTime);
+        step++;
+        nextStepTime += STEP;
+      }
+    }, 25);
+  }
 
   function unlock() {
     if (unlocked) return;
@@ -263,156 +509,178 @@ const Audio_ = (function () {
     startMusicLoop();
   }
 
-  function tone(freq, dur, type, gainVal, when, glideTo) {
-    if (!ctx) return;
-    const t0 = ctx.currentTime + (when || 0);
-    const osc = ctx.createOscillator();
-    const g = ctx.createGain();
-    osc.type = type || 'sine';
-    osc.frequency.setValueAtTime(freq, t0);
-    if (glideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(1, glideTo), t0 + dur);
-    g.gain.setValueAtTime(0.0001, t0);
-    g.gain.exponentialRampToValueAtTime(gainVal, t0 + 0.015);
-    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    osc.connect(g);
-    g.connect(sfxGain);
-    osc.start(t0);
-    osc.stop(t0 + dur + 0.02);
-  }
+  let warnTimer = 0, combo = 0, lastPickup = -10;
 
-  function noiseBurst(dur, gainVal, when, filterFreq) {
-    if (!ctx) return;
-    const t0 = ctx.currentTime + (when || 0);
-    const bufferSize = Math.floor(ctx.sampleRate * dur);
-    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const data = buffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
-    const src = ctx.createBufferSource();
-    src.buffer = buffer;
-    const filt = ctx.createBiquadFilter();
-    filt.type = 'lowpass';
-    filt.frequency.value = filterFreq || 2000;
-    const g = ctx.createGain();
-    g.gain.setValueAtTime(gainVal, t0);
-    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-    src.connect(filt);
-    filt.connect(g);
-    g.connect(sfxGain);
-    src.start(t0);
-    src.stop(t0 + dur + 0.02);
-  }
-
-  // Continuous jet engine drone: a looping filtered-noise "air rush" plus a
-  // low sawtooth "turbine whine", both gain-automated in real time rather
-  // than re-triggered every frame -- boosting pushes the filter/pitch up
-  // and gets louder, matching the engine glow getting brighter on the jet.
-  let engineStarted = false;
-  let engineNoiseGain = null, engineFilter = null, engineOsc = null, engineOscGain = null;
-
-  function startEngine() {
-    if (!ctx || engineStarted) return;
-    engineStarted = true;
-
-    const bufSize = ctx.sampleRate; // 1s loop
-    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
-    const data = buf.getChannelData(0);
-    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
-    const noiseSrc = ctx.createBufferSource();
-    noiseSrc.buffer = buf;
-    noiseSrc.loop = true;
-    engineFilter = ctx.createBiquadFilter();
-    engineFilter.type = 'bandpass';
-    engineFilter.frequency.value = 500;
-    engineFilter.Q.value = 0.9;
-    engineNoiseGain = ctx.createGain();
-    engineNoiseGain.gain.value = 0;
-    noiseSrc.connect(engineFilter);
-    engineFilter.connect(engineNoiseGain);
-    engineNoiseGain.connect(sfxGain);
-    noiseSrc.start();
-
-    engineOsc = ctx.createOscillator();
-    engineOsc.type = 'sawtooth';
-    engineOsc.frequency.value = 80;
-    engineOscGain = ctx.createGain();
-    engineOscGain.gain.value = 0;
-    engineOsc.connect(engineOscGain);
-    engineOscGain.connect(sfxGain);
-    engineOsc.start();
-  }
-
-  // Called every frame with the jet's current flight state -- ramps the
-  // engine smoothly rather than snapping, so it never clicks or pops.
-  function setEngine(flying, boosting) {
-    ensureCtx();
-    startEngine();
-    if (!ctx || !engineNoiseGain) return;
-    const t = ctx.currentTime;
-    const noiseTarget = !flying ? 0 : boosting ? 0.24 : 0.1;
-    const oscTarget = !flying ? 0 : boosting ? 0.1 : 0.035;
-    const filterTarget = boosting ? 950 : 480;
-    const pitchTarget = boosting ? 145 : 78;
-    engineNoiseGain.gain.setTargetAtTime(noiseTarget, t, 0.15);
-    engineOscGain.gain.setTargetAtTime(oscTarget, t, 0.15);
-    engineFilter.frequency.setTargetAtTime(filterTarget, t, 0.25);
-    engineOsc.frequency.setTargetAtTime(pitchTarget, t, 0.2);
-  }
-
-  function startMusicLoop() {
-    if (!ctx || musicTimer) return;
-    const notes = [261.6, 293.7, 329.6, 392.0, 440.0, 392.0, 329.6, 293.7];
-    musicTimer = setInterval(() => {
-      if (!ctx) return;
-      const f = notes[musicStep % notes.length];
-      musicStep++;
-      const t0 = ctx.currentTime;
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = f / 2;
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.18, t0 + 0.08);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.9);
-      osc.connect(g);
-      g.connect(musicGain);
-      osc.start(t0);
-      osc.stop(t0 + 1);
-    }, 700);
-  }
-
-  return {
+  const api = {
     unlock,
     setEngine,
-    setMusicOn(on) { save.musicOn = on; if (musicGain) musicGain.gain.value = on ? 0.22 : 0; },
-    setSoundOn(on) { save.soundOn = on; if (sfxGain) sfxGain.gain.value = on ? 0.6 : 0; },
-    bulletPickup() { ensureCtx(); tone(1200, 0.12, 'sine', 0.5, 0, 1800); },
-    closeCall() { ensureCtx(); noiseBurst(0.25, 0.25, 0, 3000); },
-    launch() { ensureCtx(); tone(180, 0.15, 'square', 0.3, 0, 340); },
-    boom() {
-      ensureCtx();
-      // Layered explosion: a sharp crack, a punchy noise body, a dropping
-      // bass thump (+ sub for weight), and a quiet crackling debris tail --
-      // pitch is jittered a little each time so repeated explosions don't
-      // all sound identical.
-      const j = rand(0.9, 1.1);
-      noiseBurst(0.05, 0.45, 0, 6500);
-      noiseBurst(0.32, 0.65, 0.01, 1100);
-      tone(190 * j, 0.32, 'sine', 0.5, 0, 35);
-      tone(95 * j, 0.5, 'triangle', 0.3, 0.02, 25);
-      noiseBurst(0.3, 0.16, 0.09, 2400);
+    // Stops every sound (including music) while the game is paused or hidden.
+    setSuspended(s) {
+      if (!ctx || !unlocked) return;
+      if (s && ctx.state === 'running') ctx.suspend();
+      else if (!s && ctx.state !== 'running') ctx.resume();
     },
-    click() { ensureCtx(); tone(700, 0.05, 'square', 0.25); },
-    denied() { ensureCtx(); tone(160, 0.1, 'square', 0.2, 0, 90); },
-    refuel() { ensureCtx(); tone(300, 0.18, 'sine', 0.4, 0, 700); tone(450, 0.14, 'sine', 0.3, 0.08, 900); },
-    lowFuel() { ensureCtx(); tone(220, 0.15, 'square', 0.25, 0); tone(220, 0.15, 'square', 0.25, 0.2); },
-    flareBurst() { ensureCtx(); noiseBurst(0.5, 0.7, 0, 1600); tone(140, 0.35, 'sawtooth', 0.4, 0, 45); },
-    // Each power-up now has its own activation sound instead of sharing one
-    // generic chime.
-    boostActivate() { ensureCtx(); tone(220, 0.3, 'sawtooth', 0.35, 0, 950); noiseBurst(0.2, 0.18, 0.02, 4200); },
-    shieldActivate() { ensureCtx(); tone(800, 0.12, 'sine', 0.3, 0, 1300); tone(1100, 0.16, 'sine', 0.28, 0.08, 1700); },
-    slowmoActivate() { ensureCtx(); tone(650, 0.5, 'sine', 0.32, 0, 140); tone(650, 0.35, 'sine', 0.18, 0.05, 160); },
-    empActivate() { ensureCtx(); tone(1400, 0.08, 'square', 0.3, 0, 60); noiseBurst(0.18, 0.35, 0.02, 5500); },
+    setMusicOn(on) {
+      save.musicOn = on;
+      if (musicGain) musicGain.gain.setTargetAtTime(on ? MUSIC_VOL : 0, ctx.currentTime, 0.05);
+    },
+    setSoundOn(on) {
+      save.soundOn = on;
+      if (sfxGain) sfxGain.gain.setTargetAtTime(on ? SFX_VOL : 0, ctx.currentTime, 0.05);
+    },
+
+    // Missile Approach Warning: beeps speed up as the closest chasing missile closes in.
+    warning(nearest, radar, dt) {
+      if (!ctx || !unlocked || nearest === null || nearest > WARN_RANGE) { warnTimer = 0; return; }
+      warnTimer -= dt;
+      if (warnTimer > 0) return;
+      const k = clamp(nearest / WARN_RANGE, 0, 1);
+      warnTimer = lerp(0.09, 0.5, k);
+      osc('sine', radar ? 1250 : 950, ctx.currentTime, 0.05, lerp(0.16, 0.06, k), sfxGain, { attack: 0.003 });
+    },
+
+    bulletPickup() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      // Quick pickups climb a major scale, a classic "combo" reward.
+      combo = t - lastPickup < 1.3 ? Math.min(combo + 1, 8) : 0;
+      lastPickup = t;
+      const f = 1046.5 * Math.pow(2, [0, 2, 4, 5, 7, 9, 11, 12, 14][combo] / 12);
+      osc('triangle', f, t, 0.18, 0.26, sfxGain);
+      osc('sine', f * 1.5, t + 0.04, 0.22, 0.14, sfxGain);
+      osc('sine', f * 3, t + 0.02, 0.12, 0.04, sfxGain);
+    },
+    closeCall(x, y) {
+      if (!ready() || !allow('flyby', 0.15)) return;
+      const t = ctx.currentTime, d = at(x, y);
+      noise(t, 0.45, 0.6, d, { type: 'bandpass', freq: 3200, q: 1.5, sweepTo: 600, attack: 0.05 });
+      osc('triangle', 520, t, 0.35, 0.11, d, { glide: 260, attack: 0.04 });
+    },
+    // Ignition thump, then the rising whoosh and hiss of a rocket motor.
+    launch(x, y) {
+      if (!ready() || !allow('launch', 0.05)) return;
+      const t = ctx.currentTime, d = at(x, y);
+      osc('sine', 140, t, 0.18, 0.32, d, { glide: 55 });
+      noise(t, 0.7, 0.3, d, { type: 'bandpass', freq: 500, q: 1.2, sweepTo: 2600, attack: 0.06 });
+      noise(t + 0.05, 0.9, 0.1, d, { type: 'highpass', freq: 4000 });
+    },
+    // Cockpit radar-warning receiver calling a radar lock, plus the launch itself.
+    radarLock(x, y) {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      for (let i = 0; i < 5; i++) osc('triangle', 1150, t + i * 0.085, 0.06, 0.15, sfxGain, { attack: 0.004 });
+      api.launch(x, y);
+    },
+    // Layered explosion: crack, filtered body, sub thump, debris crackle (+ rumble for the jet).
+    boom(x, y, big) {
+      if (!ready() || !allow(big ? 'bigboom' : 'boom', 0.07)) return;
+      const t = ctx.currentTime, d = at(x, y), j = rand(0.9, 1.1), s = big ? 1.5 : 1, v = big ? 1.3 : 1;
+      noise(t, 0.06, 0.5 * v, d, { type: 'highpass', freq: 2500 });
+      noise(t, 0.5 * s, 0.7 * v, d, { freq: 1600 * j, sweepTo: 220, attack: 0.004 });
+      osc('sine', (big ? 85 : 110) * j, t, 0.45 * s, 0.6 * v, d, { glide: 30 });
+      for (let i = 0; i < (big ? 9 : 5); i++) {
+        noise(t + 0.08 + Math.random() * 0.35 * s, 0.03, 0.12, d, { type: 'bandpass', freq: rand(1500, 4000), q: 2 });
+      }
+      if (big) noise(t + 0.1, 1.6, 0.6, d, { freq: 450, sweepTo: 80, attack: 0.08 });
+    },
+    gameOver(newRecord) {
+      if (!ready()) return;
+      const t = ctx.currentTime + 0.6;
+      const notes = newRecord ? [72, 76, 79, 84, 88] : [69, 65, 62, 57];
+      notes.forEach((n, i) => osc('triangle', mtof(n), t + i * 0.13, 0.4, 0.18, sfxGain, { attack: 0.01 }));
+    },
+    click() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      osc('sine', 1400, t, 0.035, 0.16, sfxGain, { attack: 0.002 });
+      noise(t, 0.015, 0.08, sfxGain, { type: 'highpass', freq: 5000 });
+    },
+    denied() {
+      if (!ready() || !allow('denied', 0.12)) return;
+      const t = ctx.currentTime;
+      osc('triangle', 240, t, 0.12, 0.22, sfxGain, { glide: 170 });
+      osc('triangle', 200, t + 0.08, 0.14, 0.18, sfxGain, { glide: 140 });
+    },
+    // Fuel glugging into the tank: three rising bubbles.
+    refuel() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      [300, 420, 560].forEach((f, i) => osc('sine', f, t + i * 0.07, 0.09, 0.25, sfxGain, { glide: f * 1.6 }));
+      noise(t, 0.25, 0.06, sfxGain, { freq: 900 });
+    },
+    // Two-tone "bingo fuel" caution, repeated by the game while fuel is low.
+    lowFuel() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      osc('triangle', 740, t, 0.13, 0.2, sfxGain);
+      osc('triangle', 587, t + 0.15, 0.16, 0.2, sfxGain);
+    },
+    // Burning-magnesium hiss and crackle after a salvo.
+    flareBurst() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      noise(t, 1.4, 0.09, sfxGain, { type: 'highpass', freq: 2500, attack: 0.08 });
+      for (let i = 0; i < 8; i++) noise(t + Math.random() * 1.2, 0.02, 0.07, sfxGain, { type: 'bandpass', freq: rand(2000, 5000), q: 3 });
+    },
+    // Dispenser cartridge firing: a dull thump with a click.
+    flarePop() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      osc('sine', 200, t, 0.07, 0.24, sfxGain, { glide: 70 });
+      noise(t, 0.025, 0.2, sfxGain, { type: 'highpass', freq: 3500 });
+    },
+    decoyed() {
+      if (!ready() || !allow('decoy', 0.1)) return;
+      const t = ctx.currentTime;
+      osc('triangle', 880, t, 0.12, 0.2, sfxGain);
+      osc('triangle', 1320, t + 0.07, 0.16, 0.17, sfxGain);
+    },
+    levelUp() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      [72, 76, 79, 84].forEach((n, i) => {
+        osc('triangle', mtof(n), t + i * 0.09, 0.28, 0.2, sfxGain, { attack: 0.01 });
+        osc('sine', mtof(n + 12), t + i * 0.09, 0.2, 0.05, sfxGain);
+      });
+    },
+    // Afterburner light-off: a low thump into a rising roar.
+    boostActivate() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      osc('sine', 90, t, 0.3, 0.35, sfxGain, { glide: 55 });
+      noise(t, 0.7, 0.45, sfxGain, { freq: 300, sweepTo: 2400, attack: 0.03 });
+    },
+    shieldActivate() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      for (const c of [-12, 0, 12]) osc('sine', 420, t, 0.45, 0.1, sfxGain, { glide: 1260, detune: c, attack: 0.02 });
+      osc('triangle', 2500, t + 0.25, 0.3, 0.04, sfxGain);
+    },
+    // A missile hitting the shield: inharmonic metallic partials.
+    shieldHit() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      [[523, 0.2], [1180, 0.12], [1870, 0.08], [2650, 0.05]].forEach(([f, g]) => osc('sine', f, t, 0.6, g, sfxGain, { attack: 0.002 }));
+      noise(t, 0.05, 0.25, sfxGain, { type: 'highpass', freq: 4000 });
+    },
+    // Tape slowing down.
+    slowmoActivate() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      osc('sine', 900, t, 0.7, 0.22, sfxGain, { glide: 140 });
+      osc('triangle', 450, t, 0.7, 0.12, sfxGain, { glide: 70 });
+      noise(t, 0.6, 0.08, sfxGain, { freq: 2000, sweepTo: 200 });
+    },
+    // Electric zap falling into a heavy sub drop.
+    empActivate() {
+      if (!ready()) return;
+      const t = ctx.currentTime;
+      noise(t, 0.5, 0.35, sfxGain, { type: 'bandpass', freq: 6000, q: 3, sweepTo: 300 });
+      osc('sine', 160, t, 0.6, 0.5, sfxGain, { glide: 30 });
+      for (let i = 0; i < 4; i++) osc('triangle', rand(1500, 3000), t + i * 0.05, 0.04, 0.08, sfxGain);
+    },
   };
+  return api;
 })();
 
 /* ------------------------------ 5. CANVAS -------------------------------- */
@@ -420,25 +688,31 @@ const Audio_ = (function () {
 const canvas = document.getElementById('game');
 const ctx2d = canvas.getContext('2d');
 let dpr = 1;
-let scale = 1;
+let viewScale = 1; // CSS px per view unit
 
-// The canvas element itself is centered in the viewport by CSS flexbox
-// (#game-root), so no internal letterbox offset is needed here -- the
-// canvas's own pixel buffer always exactly covers LOGICAL_W x LOGICAL_H.
+// Fills the whole window: the backing store matches the window in device
+// pixels (so nothing is resampled or blurred) and the view adapts to the shape.
 function resize() {
   dpr = Math.min(window.devicePixelRatio || 1, 3);
-  const vw = window.innerWidth || 1;
-  const vh = window.innerHeight || 1;
-  scale = Math.max(0.001, Math.min(vw / LOGICAL_W, vh / LOGICAL_H));
-  const cssW = LOGICAL_W * scale;
-  const cssH = LOGICAL_H * scale;
+  const bufW = Math.max(1, Math.floor((window.innerWidth || 1) * dpr));
+  const bufH = Math.max(1, Math.floor((window.innerHeight || 1) * dpr));
+  const cssW = bufW / dpr, cssH = bufH / dpr;
+  // Same world area as the base view, but never fewer than BASE_W units on the short side.
+  viewScale = Math.max(0.001, Math.min(Math.sqrt((cssW * cssH) / (BASE_W * BASE_H)), Math.min(cssW, cssH) / BASE_W));
+  VIEW_W = cssW / viewScale;
+  VIEW_H = cssH / viewScale;
+  canvas.width = bufW;
+  canvas.height = bufH;
   canvas.style.width = cssW + 'px';
   canvas.style.height = cssH + 'px';
-  canvas.width = Math.max(1, Math.round(cssW * dpr));
-  canvas.height = Math.max(1, Math.round(cssH * dpr));
+  layoutHud();
 }
 window.addEventListener('resize', resize);
-resize();
+
+// How much farther the view reaches than the base view (1 on most screens).
+function viewReach() {
+  return Math.max(1, Math.hypot(VIEW_W, VIEW_H) / BASE_DIAG);
+}
 
 /* ------------------------------ 6. INPUT --------------------------------- */
 
@@ -447,24 +721,26 @@ const Input = {
   steerRightPointers: new Set(),
   keyLeft: false,
   keyRight: false,
+  usedKeyboard: false, // once true, power-up buttons show their 1-5 key hints
 };
 
 function canvasPointFromEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) / rect.width * LOGICAL_W;
-  const y = (e.clientY - rect.top) / rect.height * LOGICAL_H;
+  const x = (e.clientX - rect.left) / rect.width * VIEW_W;
+  const y = (e.clientY - rect.top) / rect.height * VIEW_H;
   return { x, y };
 }
 
 function hitTestButtons(x, y) {
-  // Returns a button id if (x,y) in logical space hits a HUD/power-up button.
-  for (const b of hudButtons) {
-    if (dist(x, y, b.x, b.y) <= b.r) return b.id;
+  // Hit area is at least 48 CSS px across (touch-target guideline); when hit areas
+  // overlap, the nearest button wins.
+  const minR = 24 / viewScale;
+  let best = null, bestD = Infinity;
+  for (const b of hudButtons.concat(powerupButtons)) {
+    const d = dist(x, y, b.x, b.y);
+    if (d <= Math.max(b.r + 4, minR) && d < bestD) { best = b.id; bestD = d; }
   }
-  for (const b of powerupButtons) {
-    if (dist(x, y, b.x, b.y) <= b.r) return b.id;
-  }
-  return null;
+  return best;
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -479,7 +755,7 @@ canvas.addEventListener('pointerdown', (e) => {
     handleNonPlayingTap();
     return;
   }
-  if (p.x < LOGICAL_W / 2) Input.steerLeftPointers.add(e.pointerId);
+  if (p.x < VIEW_W / 2) Input.steerLeftPointers.add(e.pointerId);
   else Input.steerRightPointers.add(e.pointerId);
 });
 canvas.addEventListener('pointerup', (e) => {
@@ -495,12 +771,31 @@ canvas.addEventListener('pointerleave', (e) => {
   Input.steerRightPointers.delete(e.pointerId);
 });
 
+// Testing aids (debug overlay, free bullets) only exist when the page is opened with ?debug=1.
+const DEBUG_ALLOWED = /[?&]debug=1\b/.test(location.search);
+const POWERUP_KEYS = { '1': 'boost', '2': 'flares', '3': 'shield', '4': 'slowmo', '5': 'emp' };
+
+// Enter/Space: start from the title hint, replay after game over, resume from pause.
+function confirmAction() {
+  if (Game.state === 'hint' || Game.state === 'boot') startRun();
+  else if (Game.state === 'gameover' && Game.overT > 0.8) { Audio_.click(); startRun(); }
+  else if (Game.state === 'paused') { Audio_.click(); Game.state = 'playing'; Game.pauseSource = null; }
+}
+
 window.addEventListener('keydown', (e) => {
+  const steerKey = ['ArrowLeft', 'ArrowRight', 'a', 'A', 'd', 'D'].includes(e.key);
   if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') Input.keyLeft = true;
   if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') Input.keyRight = true;
-  if (e.key === 'p' || e.key === 'P') togglePause();
+  if (steerKey && Game.state === 'hint') startRun();
+  if (POWERUP_KEYS[e.key]) { Input.usedKeyboard = true; activatePowerup(POWERUP_KEYS[e.key]); }
+  if (e.key === 'Enter' || e.key === ' ') {
+    if (e.key === ' ') e.preventDefault(); // keep Space from scrolling the host page
+    if (!e.repeat) confirmAction();
+  }
+  // Esc is allowed to pause, but its default is never prevented (Playables rule).
+  if (e.key === 'p' || e.key === 'P' || e.key === 'Escape') togglePause();
   // 'd' already steers right (A/D scheme), so debug uses backtick instead.
-  if (e.key === '`') Game.debug = !Game.debug;
+  if (DEBUG_ALLOWED && e.key === '`') Game.debug = !Game.debug;
   // Testing aid: while debug mode is on, grant bullets + full fuel so every
   // power-up can be tried immediately instead of earning them normally.
   if (Game.debug && (e.key === 'g' || e.key === 'G')) {
@@ -556,8 +851,10 @@ const jet = {
   shieldTimer: 0,
   slowmoTimer: 0,
   flareFlash: 0,
+  flarePairsLeft: 0,
+  flarePairTimer: 0,
   fuel: FUEL_MAX,
-  fuelWarned: false,
+  fuelWarnTimer: 0,
 };
 
 const camera = { x: 0, y: 0 };
@@ -573,21 +870,26 @@ let missileIdCounter = 1;
 const missilePool = makePool(
   () => ({
     id: 0, x: 0, y: 0, heading: 0, age: 0, lifetime: 0, alive: false,
-    closeCallArmed: true, trail: [],
+    closeCallArmed: true, trail: [], decoyId: null, rolledSalvo: 0, lostLock: 0,
+    kind: 'ir', burnTime: 0,
   }),
-  (m, x, y, heading) => {
+  (m, x, y, heading, kind) => {
     m.id = missileIdCounter++;
     m.x = x; m.y = y; m.heading = heading; m.age = 0;
+    m.kind = kind || 'ir';
     m.lifetime = rand(MISSILE_LIFETIME_MIN, MISSILE_LIFETIME_MAX);
+    m.burnTime = m.lifetime - MISSILE_COAST_TIME;
     m.alive = true;
     m.closeCallArmed = true;
     m.trail.length = 0;
+    m.decoyId = null;
+    m.rolledSalvo = flareSalvoCounter; // only flares dropped after launch can fool it
+    m.lostLock = 0;
   }
 );
 
 let missileSpawnTimer = FIRST_MISSILE_DELAY;
-let missileCap = MAX_MISSILES_START;
-let missileCapTimer = 0;
+let missileCap = LEVELS[0].cap;
 
 function missileSpeedMult(elapsed) {
   const t = clamp(elapsed / MISSILE_SPEED_RAMP_TIME, 0, 1);
@@ -596,27 +898,35 @@ function missileSpeedMult(elapsed) {
 
 function trySpawnMissile(elapsed) {
   if (missilePool.active.length >= missileCap) return;
-  const spawnDist = Math.hypot(LOGICAL_W, LOGICAL_H) / 2 + 60;
   let angle;
   do {
     angle = rand(0, Math.PI * 2);
   } while (Math.abs(angleDiff(jet.heading, angle)) < MISSILE_SPAWN_FRONT_EXCLUDE);
+  // Base-view distance, pushed out on very wide/tall screens so it still spawns off-screen.
+  const toEdge = Math.min(
+    VIEW_W / 2 / Math.max(1e-6, Math.abs(Math.cos(angle))),
+    VIEW_H / 2 / Math.max(1e-6, Math.abs(Math.sin(angle))),
+  );
+  const spawnDist = Math.max(BASE_DIAG / 2, toEdge) + 60;
   const x = jet.x + Math.cos(angle) * spawnDist;
   const y = jet.y + Math.sin(angle) * spawnDist;
   const headingToJet = Math.atan2(jet.y - y, jet.x - x);
-  missilePool.spawn(x, y, headingToJet);
-  Audio_.launch();
+  const kind = Math.random() < levelConfig(Game.level).radar ? 'radar' : 'ir';
+  missilePool.spawn(x, y, headingToJet, kind);
+  if (kind === 'radar') Audio_.radarLock(x, y); else Audio_.launch(x, y);
 }
 
-/* ------------------------------ 9b. INTERCEPTORS (Flares power-up) --------- */
-// Fast, fire-trailed counter-missiles the jet launches when Flares is used;
-// each one locks onto one enemy missile and chases it down.
+/* ------------------------------ 9b. DECOY FLARES ----------------------------- */
 
-const interceptorPool = makePool(
-  () => ({ x: 0, y: 0, heading: 0, age: 0, targetId: null, alive: false }),
-  (p, x, y, heading, targetId) => {
-    p.x = x; p.y = y; p.heading = heading; p.age = 0; p.targetId = targetId;
-    p.alive = true;
+let flareIdCounter = 1;
+let flareSalvoCounter = 0;
+
+const flarePool = makePool(
+  () => ({ id: 0, x: 0, y: 0, vx: 0, vy: 0, age: 0, salvo: 0, chance: 0, alive: false }),
+  (f, x, y, vx, vy, salvo, chance) => {
+    f.id = flareIdCounter++;
+    f.x = x; f.y = y; f.vx = vx; f.vy = vy; f.age = 0;
+    f.salvo = salvo; f.chance = chance; f.alive = true;
   }
 );
 
@@ -629,12 +939,14 @@ const bulletPool = makePool(
 
 function randomBulletPos() {
   const angle = rand(0, Math.PI * 2);
-  const d = rand(120, BULLET_SPAWN_RANGE);
+  const d = rand(120, BULLET_SPAWN_RANGE * viewReach());
   return { x: jet.x + Math.cos(angle) * d, y: jet.y + Math.sin(angle) * d };
 }
 
+// Pickup counts grow with the spawn disc's area so on-screen density stays the same.
 function ensureBullets() {
-  while (bulletPool.active.length < BULLET_COUNT_TARGET) {
+  const target = Math.round(BULLET_COUNT_TARGET * viewReach() ** 2);
+  while (bulletPool.active.length < target) {
     const p = randomBulletPos();
     bulletPool.spawn(p.x, p.y);
   }
@@ -649,12 +961,13 @@ const fuelCanPool = makePool(
 
 function randomFuelCanPos() {
   const angle = rand(0, Math.PI * 2);
-  const d = rand(150, FUEL_CAN_SPAWN_RANGE);
+  const d = rand(150, FUEL_CAN_SPAWN_RANGE * viewReach());
   return { x: jet.x + Math.cos(angle) * d, y: jet.y + Math.sin(angle) * d };
 }
 
 function ensureFuelCans() {
-  while (fuelCanPool.active.length < FUEL_CAN_COUNT_TARGET) {
+  const target = Math.round(FUEL_CAN_COUNT_TARGET * viewReach() ** 2);
+  while (fuelCanPool.active.length < target) {
     const p = randomFuelCanPos();
     fuelCanPool.spawn(p.x, p.y);
   }
@@ -692,44 +1005,40 @@ function spawnShockwave(x, y) {
   particlePool.spawn(x, y, 0, 0, 0.5, 4, 'rgba(255,255,255,0.8)', 'ring');
 }
 
-// A big, layered flame burst -- yellow-hot core, orange mid-flames, red
-// outer tongues, plus smoke and a shockwave ring for a satisfying explosion.
-function spawnFireBurst(x, y) {
-  spawnBurst(x, y, '#FFE47A', 18, 100, 260, 0.45);
-  spawnBurst(x, y, '#FFB84D', 26, 80, 220, 0.6);
-  spawnBurst(x, y, '#FF6A2E', 26, 55, 170, 0.75);
-  spawnBurst(x, y, '#E4453A', 18, 35, 120, 0.9);
-  spawnSmokePuff(x, y);
-  spawnSmokePuff(x, y);
-  spawnShockwave(x, y);
-}
-
 /* ------------------------------ 12. FLARES ---------------------------------- */
 
-// Flares launches two fast, fire-trailed interceptor missiles from the jet;
-// each locks onto one of the nearest chasing missiles and blows it up on
-// impact -- a dramatic "fire back" rather than a passive decoy.
-function activateFlareStrike() {
-  const launchX = jet.x - Math.cos(jet.heading) * 14;
-  const launchY = jet.y - Math.sin(jet.heading) * 14;
-  spawnFireBurst(launchX, launchY);
-  jet.flareFlash = 0.6;
+// Starts a dispenser program: FLARE_PAIRS pairs released a beat apart, so the
+// burning flares fan out behind the jet in an "angel wings" pattern.
+function activateFlareSalvo() {
+  flareSalvoCounter++;
+  jet.flarePairsLeft = FLARE_PAIRS;
+  jet.flarePairTimer = 0;
+  jet.flareFlash = 0.35;
   Audio_.flareBurst();
+}
 
-  const targets = missilePool.active
-    .slice()
-    .sort((a, b) => dist2(a.x, a.y, jet.x, jet.y) - dist2(b.x, b.y, jet.x, jet.y))
-    .slice(0, FLARE_INTERCEPTOR_COUNT);
+function decoyChance(elapsed) {
+  const t = clamp(elapsed / MISSILE_SPEED_RAMP_TIME, 0, 1);
+  return lerp(DECOY_CHANCE_START, DECOY_CHANCE_END, t);
+}
 
-  for (let i = 0; i < FLARE_INTERCEPTOR_COUNT; i++) {
-    const sideSign = i === 0 ? -1 : 1;
-    const perp = jet.heading + Math.PI / 2;
-    const sx = jet.x + Math.cos(perp) * sideSign * 8 - Math.cos(jet.heading) * 10;
-    const sy = jet.y + Math.sin(perp) * sideSign * 8 - Math.sin(jet.heading) * 10;
-    const target = targets[i];
-    const heading = target ? Math.atan2(target.y - sy, target.x - sx) : jet.heading;
-    interceptorPool.spawn(sx, sy, heading, target ? target.id : null);
+function releaseFlarePair() {
+  const fx = Math.cos(jet.heading), fy = Math.sin(jet.heading);
+  const px = -fy, py = fx;
+  const speed = jetCurrentSpeed();
+  const breaking = Math.abs(jet.bank) > 0.6;
+  const chance = Math.min(0.95, decoyChance(Game.elapsed) + (breaking ? DECOY_BREAK_BONUS : 0));
+  const bx = jet.x - fx * 12, by = jet.y - fy * 12;
+  for (const side of [-1, 1]) {
+    const out = rand(110, 170);
+    const back = rand(20, 60);
+    // Flares leave with the jet's momentum, then drag pulls them behind it.
+    const vx = fx * speed * 0.55 + px * side * out - fx * back;
+    const vy = fy * speed * 0.55 + py * side * out - fy * back;
+    flarePool.spawn(bx + px * side * 6, by + py * side * 6, vx, vy, flareSalvoCounter, chance);
+    spawnBurst(bx + px * side * 6, by + py * side * 6, '#FFF3B0', 4, 30, 90, 0.25);
   }
+  Audio_.flarePop();
 }
 
 /* ------------------------------ 13. GAME STATE ------------------------------ */
@@ -753,21 +1062,32 @@ const Game = {
   radarSweep: 0,
   finalScore: 0,
   deathReason: 'missile', // 'missile' | 'fuel'
+  overT: 0, // seconds since game over, drives the result-screen animations
+  level: 1,
+  levelBanner: 0, // seconds left on the "Level N" banner
+  levelMsg: '',
+  shake: 0,  // 0..1 camera shake
+  danger: 0, // 0..1 how close the nearest chasing missile is (red edge glow)
 };
 
 function resetRun() {
   missilePool.releaseAll();
-  interceptorPool.releaseAll();
+  flarePool.releaseAll();
   bulletPool.releaseAll();
   fuelCanPool.releaseAll();
   particlePool.releaseAll();
   jet.x = 0; jet.y = 0; jet.heading = -Math.PI / 2; jet.bank = 0;
   jet.boostTimer = 0; jet.shieldTimer = 0; jet.slowmoTimer = 0; jet.flareFlash = 0;
-  jet.fuel = FUEL_MAX; jet.fuelWarned = false;
+  jet.flarePairsLeft = 0; jet.flarePairTimer = 0;
+  jet.fuel = FUEL_MAX; jet.fuelWarnTimer = 0;
+  Game.shake = 0;
+  Game.danger = 0;
   camera.x = 0; camera.y = 0;
   missileSpawnTimer = FIRST_MISSILE_DELAY;
-  missileCap = MAX_MISSILES_START;
-  missileCapTimer = 0;
+  missileCap = LEVELS[0].cap;
+  Game.level = 1;
+  Game.levelBanner = 0;
+  Game.levelMsg = '';
   Game.score = 0;
   Game.displayScore = 0;
   Game.elapsed = 0;
@@ -795,7 +1115,9 @@ function startRun() {
 function endRun(reason) {
   Game.state = 'gameover';
   Game.deathReason = reason || 'missile';
-  Audio_.boom();
+  Game.overT = 0;
+  Audio_.boom(jet.x, jet.y, true);
+  addShake(jet.x, jet.y, 1);
   Game.deathFlash = 1;
   spawnSmokePuff(jet.x, jet.y);
   spawnSmokePuff(jet.x, jet.y);
@@ -807,8 +1129,18 @@ function endRun(reason) {
     save.bestScore = finalScore;
     Game.newRecord = true;
   }
+  Audio_.gameOver(Game.newRecord);
   Platform.saveData(save);
   Platform.sendScore(save.bestScore);
+}
+
+const reducedMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+// Camera shake scaled by how close the blast is to the jet (off for reduced-motion users).
+function addShake(x, y, strength) {
+  if (reducedMotion) return;
+  const near = clamp(1 - dist(x, y, jet.x, jet.y) / 500, 0, 1);
+  Game.shake = Math.min(1, Game.shake + strength * near);
 }
 
 /* ------------------------------ 14. POWER-UPS -------------------------------- */
@@ -833,7 +1165,7 @@ function activatePowerup(id) {
       Audio_.boostActivate();
       break;
     case 'flares':
-      activateFlareStrike(); // plays its own flareBurst() sound
+      activateFlareSalvo(); // plays its own flareBurst() sound
       break;
     case 'shield':
       jet.shieldTimer = SHIELD_DURATION;
@@ -857,7 +1189,8 @@ function destroyMissile(m, awardScore = true) {
   spawnSmokePuff(m.x, m.y);
   spawnBurst(m.x, m.y, COLORS.orange, 10, 40, 140, 0.5);
   missilePool.release(m);
-  Audio_.boom();
+  Audio_.boom(m.x, m.y);
+  addShake(m.x, m.y, 0.35);
   if (awardScore) {
     Game.missilesDown++;
     addScore(SCORE_MISSILE_DOWN, 'Missile down +15', m.x, m.y - 20, COLORS.white);
@@ -880,10 +1213,12 @@ function update(dtRaw) {
   Game.displayScore = lerp(Game.displayScore, Game.score, Math.min(1, dt * 8));
   Game.radarSweep = (Game.radarSweep + dt / 2.5 * Math.PI * 2) % (Math.PI * 2);
   Game.deathFlash = Math.max(0, Game.deathFlash - dt / 0.08);
+  Game.shake = Math.max(0, Game.shake - dt * 2.5);
   for (const k in deniedFlash) deniedFlash[k] = Math.max(0, deniedFlash[k] - dt);
 
+  // The title hint stays up (gently pulsing) until the player actually starts.
   if (Game.state === 'hint') {
-    Game.startHintAlpha = Math.max(0, Game.startHintAlpha - dt / 2.5);
+    Game.startHintAlpha = 0.75 + 0.25 * Math.sin(performance.now() / 400);
   }
 
   // Continuous engine hum -- runs (or fades out) every frame regardless of
@@ -908,15 +1243,26 @@ function update(dtRaw) {
     if (jet.shieldTimer > 0) jet.shieldTimer = Math.max(0, jet.shieldTimer - dt);
     if (jet.slowmoTimer > 0) jet.slowmoTimer = Math.max(0, jet.slowmoTimer - dt);
     if (jet.flareFlash > 0) jet.flareFlash = Math.max(0, jet.flareFlash - dt / FLARE_FLASH_DURATION);
+    if (jet.flarePairsLeft > 0) {
+      jet.flarePairTimer -= dt;
+      if (jet.flarePairTimer <= 0) {
+        releaseFlarePair();
+        jet.flarePairsLeft--;
+        jet.flarePairTimer = FLARE_PAIR_INTERVAL;
+      }
+    }
 
     // Fuel drains steadily; running dry crashes the jet just like a missile hit.
     jet.fuel = Math.max(0, jet.fuel - FUEL_DRAIN_RATE * dt);
     const fuelPct = jet.fuel / FUEL_MAX;
-    if (fuelPct < FUEL_LOW_THRESHOLD && !jet.fuelWarned) {
-      jet.fuelWarned = true;
-      Audio_.lowFuel();
-    } else if (fuelPct >= FUEL_LOW_THRESHOLD) {
-      jet.fuelWarned = false;
+    if (fuelPct < FUEL_LOW_THRESHOLD) {
+      jet.fuelWarnTimer -= dt;
+      if (jet.fuelWarnTimer <= 0) {
+        Audio_.lowFuel();
+        jet.fuelWarnTimer = 1.6;
+      }
+    } else {
+      jet.fuelWarnTimer = 0;
     }
     if (jet.fuel <= 0) {
       endRun('fuel');
@@ -938,21 +1284,42 @@ function update(dtRaw) {
       spawnBurst(jet.x - Math.cos(jet.heading) * 16, jet.y - Math.sin(jet.heading) * 16, COLORS.orange, 1, 10, 40, 0.4);
     }
 
-    // Missile spawn pacing
-    missileCapTimer += dt;
-    if (missileCapTimer >= MISSILE_CAP_INCREASE_INTERVAL) {
-      missileCapTimer = 0;
-      missileCap = Math.min(MISSILE_CAP_MAX, missileCap + 1);
+    // Levels: more missiles (and later radar-guided ones) as the run goes on.
+    const level = 1 + Math.floor(Game.elapsed / LEVEL_DURATION);
+    if (level > Game.level) {
+      Game.level = level;
+      missileCap = levelConfig(level).cap;
+      Game.levelBanner = 2.4;
+      Game.levelMsg = levelConfig(level).msg || `${missileCap} missiles at once`;
+      addScore(SCORE_LEVEL_UP * level, `Level ${level} +${SCORE_LEVEL_UP * level}`, jet.x, jet.y - 46, '#FFE47A');
+      Audio_.levelUp();
+      Platform.saveData(save); // keep bullets earned so far if the player leaves mid-run
     }
+    if (Game.levelBanner > 0) Game.levelBanner = Math.max(0, Game.levelBanner - dt);
     missileSpawnTimer -= dt;
     if (missileSpawnTimer <= 0) {
       trySpawnMissile(Game.elapsed);
-      missileSpawnTimer = rand(1.2, 2.4);
+      missileSpawnTimer = rand(1.2, 2.4) * Math.max(0.6, 1 - 0.05 * (Game.level - 1));
     }
   }
 
   const missileTimeScale = jet.slowmoTimer > 0 ? SLOWMO_FACTOR : 1;
   const spdMult = missileSpeedMult(Game.elapsed);
+
+  // Flares: drag slows them so they fall behind the jet while they burn.
+  for (const f of flarePool.active.slice()) {
+    f.age += dt;
+    if (f.age >= FLARE_BURN_TIME) { flarePool.release(f); continue; }
+    const decay = Math.exp(-FLARE_DRAG * dt);
+    f.vx *= decay; f.vy *= decay;
+    f.x += f.vx * dt; f.y += f.vy * dt;
+    if (Math.random() < 0.7) {
+      particlePool.spawn(f.x, f.y, rand(-8, 8), rand(-8, 8), rand(0.6, 1.0), rand(4, 7), 'rgba(225,228,235,0.28)', 'smoke');
+    }
+    if (Math.random() < 0.25) {
+      particlePool.spawn(f.x, f.y, rand(-40, 40), rand(-40, 40), 0.25, rand(1, 2), '#FFF3B0', 'dot');
+    }
+  }
 
   for (const m of missilePool.active.slice()) {
     m.age += dt;
@@ -961,21 +1328,120 @@ function update(dtRaw) {
       missilePool.release(m);
       continue;
     }
-    const desired = Math.atan2(jet.y - m.y, jet.x - m.x);
-    const diff = angleDiff(m.heading, desired);
-    const maxTurn = MISSILE_TURN_RATE * dt * missileTimeScale;
-    m.heading += clamp(diff, -maxTurn, maxTurn);
-    const mSpeed = JET_SPEED * spdMult * missileTimeScale;
+
+    // Seeker: a newer salvo burning inside the seeker cone gets one roll per
+    // missile -- either the missile switches to the hotter flare or ignores it.
+    if (!m.decoyId && m.lostLock <= 0) {
+      let best = null, bestD = Infinity;
+      if (m.kind === 'radar') {
+        // Radar seekers don't see heat, so flares can't fool them -- say so once per salvo.
+        const seen = flarePool.active.find((f) => f.salvo > m.rolledSalvo && dist(m.x, m.y, f.x, f.y) < SEEKER_RANGE);
+        if (seen) {
+          m.rolledSalvo = seen.salvo;
+          if (playing) spawnFloatingText(m.x, m.y - 18, 'Radar lock - flares useless!', COLORS.fuelLow);
+        }
+      } else {
+        for (const f of flarePool.active) {
+          if (f.salvo <= m.rolledSalvo) continue;
+          const d = dist(m.x, m.y, f.x, f.y);
+          if (d > SEEKER_RANGE || d >= bestD) continue;
+          if (Math.abs(angleDiff(m.heading, Math.atan2(f.y - m.y, f.x - m.x))) > SEEKER_HALF_ANGLE) continue;
+          best = f; bestD = d;
+        }
+      }
+      if (best) {
+        m.rolledSalvo = best.salvo;
+        if (Math.random() < best.chance) {
+          m.decoyId = best.id;
+          if (playing) {
+            spawnFloatingText(m.x, m.y - 18, 'Decoyed!', '#FFE47A');
+            Audio_.decoyed();
+          }
+        } else if (playing) {
+          spawnFloatingText(m.x, m.y - 18, 'Ignored flares!', COLORS.fuelLow);
+        }
+      }
+    }
+
+    const coasting = m.age > m.burnTime;
+    const coastT = coasting ? (m.age - m.burnTime) / MISSILE_COAST_TIME : 0;
+    const mSpeed = JET_SPEED * spdMult * missileTimeScale
+      * (m.kind === 'radar' ? RADAR_SPEED_MULT : 1)
+      * lerp(1, MISSILE_COAST_SPEED_MIN, coastT);
+
+    let tx = jet.x, ty = jet.y, steer = true;
+    if (m.kind === 'radar') {
+      // Lead pursuit: aim where the jet will be, not where it is.
+      const tgo = Math.min(RADAR_LEAD_MAX_T, dist(m.x, m.y, jet.x, jet.y) / Math.max(1, mSpeed));
+      const js = jetCurrentSpeed() * tgo * RADAR_LEAD;
+      tx += Math.cos(jet.heading) * js;
+      ty += Math.sin(jet.heading) * js;
+    }
+    if (m.decoyId) {
+      const f = flarePool.active.find((fl) => fl.id === m.decoyId);
+      if (f) {
+        tx = f.x; ty = f.y;
+        if (dist(m.x, m.y, f.x, f.y) < FLARE_PROXIMITY) {
+          destroyMissile(m, playing);
+          continue;
+        }
+      } else {
+        m.decoyId = null;
+        m.lostLock = MISSILE_LOST_LOCK_TIME;
+      }
+    }
+    if (m.lostLock > 0) {
+      // Flare burned out: the seeker has nothing hot to follow and the missile self-destructs.
+      steer = false;
+      m.lostLock -= dt;
+      if (m.lostLock <= 0) {
+        destroyMissile(m, playing);
+        continue;
+      }
+    }
+
+    // After the jet is down, missiles coast straight instead of circling the wreck.
+    if (steer && (playing || m.decoyId)) {
+      const desired = Math.atan2(ty - m.y, tx - m.x);
+      const diff = angleDiff(m.heading, desired);
+      const maxTurn = (m.kind === 'radar' ? RADAR_TURN_RATE : MISSILE_TURN_RATE) * dt * missileTimeScale;
+      m.heading += clamp(diff, -maxTurn, maxTurn);
+    }
     m.x += Math.cos(m.heading) * mSpeed * dt;
     m.y += Math.sin(m.heading) * mSpeed * dt;
 
-    m.trail.push({ x: m.x, y: m.y, t: 0 });
+    // The smoke trail only comes from a burning motor.
+    if (!coasting) {
+      m.trail.push({ x: m.x, y: m.y, t: 0 });
+      if (Math.random() < 0.35) {
+        const back = m.kind === 'radar' ? 16 : 13;
+        particlePool.spawn(
+          m.x - Math.cos(m.heading) * back, m.y - Math.sin(m.heading) * back,
+          rand(-20, 20), rand(-20, 20), 0.22, rand(1, 2),
+          Math.random() < 0.5 ? '#FFE47A' : COLORS.orange, 'dot',
+        );
+      }
+    }
     if (m.trail.length > 80) m.trail.shift();
   }
   for (const m of missilePool.active) {
     for (const pt of m.trail) pt.t += dt;
     while (m.trail.length && m.trail[0].t > 2.5) m.trail.shift();
   }
+
+  // Missile approach warning: the closest missile still chasing the jet drives the
+  // cockpit beeps and the red edge glow.
+  let nearest = null, nearestRadar = false;
+  if (playing) {
+    for (const m of missilePool.active) {
+      if (m.decoyId || m.lostLock > 0) continue;
+      const d = dist(m.x, m.y, jet.x, jet.y);
+      if (nearest === null || d < nearest) { nearest = d; nearestRadar = m.kind === 'radar'; }
+    }
+  }
+  Audio_.warning(nearest, nearestRadar, dt);
+  const dangerTarget = nearest === null ? 0 : clamp(1 - nearest / WARN_RANGE, 0, 1);
+  Game.danger = lerp(Game.danger, dangerTarget, Math.min(1, dt * 6));
 
   // Missile vs jet
   if (playing) {
@@ -990,6 +1456,7 @@ function update(dtRaw) {
       for (const m of missilePool.active.slice()) {
         if (dist(m.x, m.y, jet.x, jet.y) < JET_RADIUS + MISSILE_RADIUS) {
           jet.shieldTimer = 0;
+          Audio_.shieldHit();
           destroyMissile(m, true);
           spawnShockwave(jet.x, jet.y);
           break;
@@ -1006,7 +1473,7 @@ function update(dtRaw) {
         m.closeCallArmed = false;
         Game.closeCalls++;
         addScore(SCORE_CLOSE_CALL, 'Close call +5', jet.x, jet.y - 30, COLORS.white);
-        Audio_.closeCall();
+        Audio_.closeCall(m.x, m.y);
       } else if (d > CLOSE_CALL_RESET_DIST) {
         m.closeCallArmed = true;
       }
@@ -1029,41 +1496,14 @@ function update(dtRaw) {
         spawnBurst(mx, my, COLORS.orange, 14, 50, 160, 0.5);
         missilePool.release(a);
         missilePool.release(b);
-        Audio_.boom();
+        Audio_.boom(mx, my);
+        addShake(mx, my, 0.45);
         if (playing) {
           Game.missilesDown += 2;
-          addScore(SCORE_MISSILE_DOWN * 2, 'Missile down +15', mx, my - 20, COLORS.white);
+          addScore(SCORE_MISSILE_DOWN * 2, `2 missiles down +${SCORE_MISSILE_DOWN * 2}`, mx, my - 20, COLORS.white);
         }
         break;
       }
-    }
-  }
-
-  // Interceptors (Flares power-up) -- home in on their assigned missile,
-  // trailing fire, and blow it up on contact; fizzle if they never catch it
-  // or their target was already destroyed some other way. Like enemy
-  // missiles, they keep flying for a moment after death; only scoring stops.
-  for (const p of interceptorPool.active.slice()) {
-    p.age += dt;
-    particlePool.spawn(
-      p.x, p.y, rand(-15, 15), rand(-15, 15), 0.25, rand(2, 4),
-      Math.random() < 0.5 ? '#FFE47A' : COLORS.orange, 'dot'
-    );
-    const target = p.targetId != null ? missilePool.active.find((m) => m.id === p.targetId) : null;
-    if (target) {
-      const desired = Math.atan2(target.y - p.y, target.x - p.x);
-      const diff = angleDiff(p.heading, desired);
-      p.heading += clamp(diff, -INTERCEPTOR_TURN_RATE * dt, INTERCEPTOR_TURN_RATE * dt);
-    }
-    p.x += Math.cos(p.heading) * INTERCEPTOR_SPEED * dt;
-    p.y += Math.sin(p.heading) * INTERCEPTOR_SPEED * dt;
-
-    if (target && dist(p.x, p.y, target.x, target.y) < INTERCEPTOR_RADIUS + MISSILE_RADIUS) {
-      interceptorPool.release(p);
-      destroyMissile(target, playing);
-    } else if (p.age >= INTERCEPTOR_LIFETIME) {
-      spawnSmokePuff(p.x, p.y);
-      interceptorPool.release(p);
     }
   }
 
@@ -1077,7 +1517,7 @@ function update(dtRaw) {
         addScore(SCORE_BULLET, '+10', s.x, s.y - 20, COLORS.white);
         spawnBurst(s.x, s.y, COLORS.gemCrown, 12, 40, 120, 0.5);
         Audio_.bulletPickup();
-      } else if (dist(s.x, s.y, jet.x, jet.y) > BULLET_DESPAWN_DIST) {
+      } else if (dist(s.x, s.y, jet.x, jet.y) > BULLET_DESPAWN_DIST * viewReach()) {
         bulletPool.release(s);
       }
     }
@@ -1090,11 +1530,10 @@ function update(dtRaw) {
       if (dist(c.x, c.y, jet.x, jet.y) < JET_RADIUS + FUEL_CAN_RADIUS) {
         fuelCanPool.release(c);
         jet.fuel = Math.min(FUEL_MAX, jet.fuel + FUEL_CAN_REFILL);
-        jet.fuelWarned = jet.fuel / FUEL_MAX < FUEL_LOW_THRESHOLD;
         spawnFloatingText(c.x, c.y - 20, '+Fuel', COLORS.fuelFull);
         spawnBurst(c.x, c.y, COLORS.fuelFull, 12, 40, 120, 0.5);
         Audio_.refuel();
-      } else if (dist(c.x, c.y, jet.x, jet.y) > FUEL_CAN_DESPAWN_DIST) {
+      } else if (dist(c.x, c.y, jet.x, jet.y) > FUEL_CAN_DESPAWN_DIST * viewReach()) {
         fuelCanPool.release(c);
       }
     }
@@ -1121,13 +1560,14 @@ function updateParticlesOnly(dt) {
   }
   if (Game.state === 'gameover') {
     Game.hudAlpha = Math.max(0, Game.hudAlpha - dt / 0.6);
+    Game.overT += dt;
   }
 }
 
 /* ------------------------------ 16. RENDER ------------------------------------ */
 
 function worldToScreen(x, y) {
-  return { sx: (x - camera.x) + LOGICAL_W / 2, sy: (y - camera.y) + LOGICAL_H / 2 };
+  return { sx: (x - camera.x) + VIEW_W / 2, sy: (y - camera.y) + VIEW_H / 2 };
 }
 
 // Night background: a deterministic pseudo-random field generated on demand
@@ -1140,28 +1580,28 @@ function bgHash(cx, cy, seed) {
 }
 
 function drawSkyGradient() {
-  const g = ctx2d.createLinearGradient(0, 0, 0, LOGICAL_H);
+  const g = ctx2d.createLinearGradient(0, 0, 0, VIEW_H);
   g.addColorStop(0, COLORS.skyTop);
   g.addColorStop(1, COLORS.skyBottom);
   ctx2d.fillStyle = g;
-  ctx2d.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+  ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
 }
 
 function drawStarfieldLayer(parallax, cellSize, density, seedOffset) {
   const px = camera.x * parallax;
   const py = camera.y * parallax;
-  const startCol = Math.floor((px - LOGICAL_W) / cellSize);
-  const endCol = Math.floor((px + LOGICAL_W) / cellSize);
-  const startRow = Math.floor((py - LOGICAL_H) / cellSize);
-  const endRow = Math.floor((py + LOGICAL_H) / cellSize);
+  const startCol = Math.floor((px - VIEW_W) / cellSize);
+  const endCol = Math.floor((px + VIEW_W) / cellSize);
+  const startRow = Math.floor((py - VIEW_H) / cellSize);
+  const endRow = Math.floor((py + VIEW_H) / cellSize);
   const now = performance.now();
   for (let cx = startCol; cx <= endCol; cx++) {
     for (let cy = startRow; cy <= endRow; cy++) {
       if (bgHash(cx, cy, seedOffset) > density) continue;
       const jx = bgHash(cx, cy, seedOffset + 1) * cellSize;
       const jy = bgHash(cx, cy, seedOffset + 2) * cellSize;
-      const sx = cx * cellSize + jx - px + LOGICAL_W / 2;
-      const sy = cy * cellSize + jy - py + LOGICAL_H / 2;
+      const sx = cx * cellSize + jx - px + VIEW_W / 2;
+      const sy = cy * cellSize + jy - py + VIEW_H / 2;
       const size = 0.8 + bgHash(cx, cy, seedOffset + 3) * 1.4;
       const phase = bgHash(cx, cy, seedOffset + 4) * Math.PI * 2;
       const twinkle = 0.5 + 0.5 * Math.sin(now / 900 + phase);
@@ -1178,17 +1618,17 @@ function drawStarfieldLayer(parallax, cellSize, density, seedOffset) {
 function drawPlanetLayer(parallax, cellSize, baseSize, density, seedOffset) {
   const px = camera.x * parallax;
   const py = camera.y * parallax;
-  const startCol = Math.floor((px - LOGICAL_W) / cellSize);
-  const endCol = Math.floor((px + LOGICAL_W) / cellSize);
-  const startRow = Math.floor((py - LOGICAL_H) / cellSize);
-  const endRow = Math.floor((py + LOGICAL_H) / cellSize);
+  const startCol = Math.floor((px - VIEW_W) / cellSize);
+  const endCol = Math.floor((px + VIEW_W) / cellSize);
+  const startRow = Math.floor((py - VIEW_H) / cellSize);
+  const endRow = Math.floor((py + VIEW_H) / cellSize);
   for (let cx = startCol; cx <= endCol; cx++) {
     for (let cy = startRow; cy <= endRow; cy++) {
       if (bgHash(cx, cy, seedOffset) > density) continue;
       const jx = bgHash(cx, cy, seedOffset + 1) * cellSize;
       const jy = bgHash(cx, cy, seedOffset + 2) * cellSize;
-      const sx = cx * cellSize + jx - px + LOGICAL_W / 2;
-      const sy = cy * cellSize + jy - py + LOGICAL_H / 2;
+      const sx = cx * cellSize + jx - px + VIEW_W / 2;
+      const sy = cy * cellSize + jy - py + VIEW_H / 2;
       const size = baseSize * (0.6 + bgHash(cx, cy, seedOffset + 3) * 0.8);
       const paletteIdx = Math.floor(bgHash(cx, cy, seedOffset + 4) * PLANET_PALETTES.length);
       drawPlanet(sx, sy, size, PLANET_PALETTES[paletteIdx % PLANET_PALETTES.length]);
@@ -1334,37 +1774,133 @@ function drawJetShape(color) {
   ctx2d.fill();
 }
 
-function drawMissile(m) {
-  if (m.trail.length > 1) {
-    ctx2d.save();
-    ctx2d.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx2d.lineWidth = 2;
-    ctx2d.setLineDash([8, 7]);
-    ctx2d.beginPath();
-    for (let i = 0; i < m.trail.length; i++) {
-      const pt = m.trail[i];
-      const alpha = 1 - pt.t / 2.5;
-      const { sx, sy } = worldToScreen(pt.x, pt.y);
-      if (i === 0) ctx2d.moveTo(sx, sy); else ctx2d.lineTo(sx, sy);
+// Rocket-motor smoke: each segment fades and spreads as it ages.
+function drawMissileTrail(m) {
+  const tr = m.trail;
+  if (tr.length < 2) return;
+  ctx2d.save();
+  ctx2d.lineCap = 'round';
+  let prev = worldToScreen(tr[0].x, tr[0].y);
+  for (let i = 1; i < tr.length; i++) {
+    const cur = worldToScreen(tr[i].x, tr[i].y);
+    const life = 1 - tr[i].t / 2.5;
+    if (life > 0) {
+      ctx2d.strokeStyle = `rgba(214,221,232,${0.4 * life})`;
+      ctx2d.lineWidth = 2 + (1 - life) * 5;
+      ctx2d.beginPath();
+      ctx2d.moveTo(prev.sx, prev.sy);
+      ctx2d.lineTo(cur.sx, cur.sy);
+      ctx2d.stroke();
     }
-    ctx2d.globalAlpha = 0.7;
-    ctx2d.stroke();
-    ctx2d.setLineDash([]);
-    ctx2d.restore();
+    prev = cur;
   }
+  ctx2d.restore();
+}
+
+// Flickering exhaust plume at the nozzle (local space, nose toward -y).
+function drawExhaustFlame(y, w) {
+  const f = 0.75 + Math.random() * 0.5;
+  const len = 9 * f + 3;
+  ctx2d.save();
+  ctx2d.globalCompositeOperation = 'lighter';
+  const glow = ctx2d.createRadialGradient(0, y + 2, 0, 0, y + 2, 9 * f);
+  glow.addColorStop(0, 'rgba(255,170,60,0.55)');
+  glow.addColorStop(1, 'rgba(255,120,40,0)');
+  ctx2d.fillStyle = glow;
+  ctx2d.beginPath();
+  ctx2d.arc(0, y + 2, 9 * f, 0, Math.PI * 2);
+  ctx2d.fill();
+  const cone = ctx2d.createLinearGradient(0, y, 0, y + len);
+  cone.addColorStop(0, 'rgba(255,205,95,0.95)');
+  cone.addColorStop(0.5, 'rgba(255,110,30,0.75)');
+  cone.addColorStop(1, 'rgba(255,60,20,0)');
+  ctx2d.fillStyle = cone;
+  ctx2d.beginPath();
+  ctx2d.moveTo(-w, y);
+  ctx2d.quadraticCurveTo(-w * 0.9, y + len * 0.5, 0, y + len);
+  ctx2d.quadraticCurveTo(w * 0.9, y + len * 0.5, w, y);
+  ctx2d.closePath();
+  ctx2d.fill();
+  ctx2d.fillStyle = 'rgba(255,250,220,0.95)';
+  ctx2d.beginPath();
+  ctx2d.moveTo(-w * 0.45, y);
+  ctx2d.lineTo(0, y + len * 0.5);
+  ctx2d.lineTo(w * 0.45, y);
+  ctx2d.closePath();
+  ctx2d.fill();
+  ctx2d.restore();
+}
+
+function finPair(x0, y0, x1, y1, x2, y2) {
+  for (const s of [-1, 1]) {
+    ctx2d.beginPath();
+    ctx2d.moveTo(x0 * s, y0);
+    ctx2d.lineTo(x1 * s, y1);
+    ctx2d.lineTo(x2 * s, y2);
+    ctx2d.closePath();
+    ctx2d.fill();
+  }
+}
+
+// Sidewinder-style heat seeker: slim grey body, glass seeker dome, nose canards, tail fins.
+// Returns the nozzle's y in local space.
+function drawIrMissileBody() {
+  ctx2d.fillStyle = '#8E969F';
+  finPair(1.6, 6, 5.5, 11, 1.6, 11);
+  finPair(1.6, -7, 4, -4.8, 1.6, -4.4);
+  ctx2d.fillStyle = '#C9CED6';
+  roundRect(-1.7, -8, 3.4, 19, 1.2);
+  ctx2d.fill();
+  ctx2d.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx2d.fillRect(0.4, -8, 1.3, 19);
+  ctx2d.fillStyle = '#E8B83A';
+  ctx2d.fillRect(-1.7, -5.6, 3.4, 1.1);
+  ctx2d.fillStyle = '#2E4A66';
+  ctx2d.beginPath();
+  ctx2d.arc(0, -8, 1.7, Math.PI, 0);
+  ctx2d.fill();
+  ctx2d.fillStyle = 'rgba(200,230,255,0.85)';
+  ctx2d.beginPath();
+  ctx2d.arc(-0.5, -8.7, 0.55, 0, Math.PI * 2);
+  ctx2d.fill();
+  ctx2d.fillStyle = '#3A3F45';
+  ctx2d.fillRect(-1.2, 11, 2.4, 1.2);
+  return 12.2;
+}
+
+// AMRAAM-style radar missile: longer white body, pointed radome, mid-body wings, tail fins.
+function drawRadarMissileBody() {
+  ctx2d.fillStyle = '#9AA3AC';
+  finPair(2, 8, 6.5, 13.5, 2, 13.5);
+  finPair(2, -2, 5, 3, 2, 3.5);
+  ctx2d.fillStyle = '#E9EDF1';
+  roundRect(-2, -8, 4, 21.5, 1.4);
+  ctx2d.fill();
+  ctx2d.fillStyle = 'rgba(0,0,0,0.16)';
+  ctx2d.fillRect(0.5, -8, 1.5, 21.5);
+  ctx2d.fillStyle = '#7D8791';
+  ctx2d.fillRect(-2, 4.5, 4, 1.2);
+  ctx2d.fillStyle = '#F3EFE4';
+  ctx2d.beginPath();
+  ctx2d.moveTo(-2, -8);
+  ctx2d.quadraticCurveTo(-1.8, -13, 0, -15.5);
+  ctx2d.quadraticCurveTo(1.8, -13, 2, -8);
+  ctx2d.closePath();
+  ctx2d.fill();
+  ctx2d.fillStyle = '#3A3F45';
+  ctx2d.fillRect(-1.4, 13.5, 2.8, 1.2);
+  return 14.7;
+}
+
+function drawMissile(m) {
+  drawMissileTrail(m);
   const { sx, sy } = worldToScreen(m.x, m.y);
   ctx2d.save();
   ctx2d.translate(sx, sy);
   ctx2d.rotate(m.heading + Math.PI / 2);
-  ctx2d.fillStyle = COLORS.missileBody;
-  ctx2d.beginPath();
-  ctx2d.moveTo(0, -7);
-  ctx2d.lineTo(2.5, 3);
-  ctx2d.lineTo(4, 6);
-  ctx2d.lineTo(-4, 6);
-  ctx2d.lineTo(-2.5, 3);
-  ctx2d.closePath();
-  ctx2d.fill();
+  const radar = m.kind === 'radar';
+  const nozzleY = radar ? drawRadarMissileBody() : drawIrMissileBody();
+  if (m.age <= m.burnTime) drawExhaustFlame(nozzleY, radar ? 2.2 : 1.9);
   ctx2d.restore();
   if (Game.debug) {
     ctx2d.strokeStyle = 'red';
@@ -1374,30 +1910,28 @@ function drawMissile(m) {
   }
 }
 
-// A small fiery interceptor missile -- its flame trail is drawn via the
-// particles it emits each frame, not a separate line here.
-function drawInterceptor(p) {
-  const { sx, sy } = worldToScreen(p.x, p.y);
+// A burning decoy flare: flickering white-hot core inside a warm glow that
+// fades in its last half-second. Its smoke trail comes from particles.
+function drawFlare(f) {
+  const { sx, sy } = worldToScreen(f.x, f.y);
+  const fade = clamp((FLARE_BURN_TIME - f.age) / 0.5, 0, 1);
+  const flicker = 0.8 + Math.random() * 0.35;
+  const r = 16 * flicker * fade + 2;
   ctx2d.save();
-  ctx2d.translate(sx, sy);
-  ctx2d.rotate(p.heading + Math.PI / 2);
-  ctx2d.fillStyle = '#FFD54A';
+  ctx2d.globalCompositeOperation = 'lighter';
+  const g = ctx2d.createRadialGradient(sx, sy, 0, sx, sy, r);
+  g.addColorStop(0, `rgba(255,255,240,${0.95 * fade})`);
+  g.addColorStop(0.25, `rgba(255,214,110,${0.7 * fade})`);
+  g.addColorStop(1, 'rgba(255,120,40,0)');
+  ctx2d.fillStyle = g;
   ctx2d.beginPath();
-  ctx2d.moveTo(0, -8);
-  ctx2d.lineTo(3, 4);
-  ctx2d.lineTo(0, 2);
-  ctx2d.lineTo(-3, 4);
-  ctx2d.closePath();
-  ctx2d.fill();
-  ctx2d.fillStyle = COLORS.orange;
-  ctx2d.beginPath();
-  ctx2d.arc(0, 5, 2.5, 0, Math.PI * 2);
+  ctx2d.arc(sx, sy, r, 0, Math.PI * 2);
   ctx2d.fill();
   ctx2d.restore();
   if (Game.debug) {
     ctx2d.strokeStyle = 'yellow';
     ctx2d.beginPath();
-    ctx2d.arc(sx, sy, INTERCEPTOR_RADIUS, 0, Math.PI * 2);
+    ctx2d.arc(sx, sy, FLARE_PROXIMITY, 0, Math.PI * 2);
     ctx2d.stroke();
   }
 }
@@ -1602,19 +2136,22 @@ function drawParticles() {
 /* ---- HUD / Radar / Buttons ---- */
 
 const hudButtons = [
-  { id: 'pause', x: LOGICAL_W - 30 - 76, y: 40, r: 20 },
-  { id: 'music', x: LOGICAL_W - 30 - 38, y: 40, r: 20 },
-  { id: 'sound', x: LOGICAL_W - 30, y: 40, r: 20 },
+  { id: 'pause', x: 0, y: 40, r: 21 },
+  { id: 'music', x: 0, y: 40, r: 21 },
+  { id: 'sound', x: 0, y: 40, r: 21 },
 ];
 
-const powerupButtons = (() => {
-  const ids = ['boost', 'flares', 'shield', 'slowmo', 'emp'];
+const powerupButtons = ['boost', 'flares', 'shield', 'slowmo', 'emp'].map((id) => ({ id, x: 0, y: 0, r: 26 }));
+
+// Anchors the HUD to the current view's edges; called on every resize.
+function layoutHud() {
+  hudButtons[0].x = VIEW_W - 30 - 92;
+  hudButtons[1].x = VIEW_W - 30 - 46;
+  hudButtons[2].x = VIEW_W - 30;
   const spacing = 68;
-  const totalW = spacing * (ids.length - 1);
-  const startX = LOGICAL_W / 2 - totalW / 2;
-  const y = LOGICAL_H - 66;
-  return ids.map((id, i) => ({ id, x: startX + i * spacing, y, r: 26 }));
-})();
+  const startX = VIEW_W / 2 - spacing * (powerupButtons.length - 1) / 2;
+  powerupButtons.forEach((b, i) => { b.x = startX + i * spacing; b.y = VIEW_H - 66; });
+}
 
 function handleButtonPress(id) {
   Audio_.unlock();
@@ -1650,6 +2187,20 @@ Platform.onSystemPause(() => {
     Game.state = 'paused';
     Game.pauseSource = 'system';
   }
+  Platform.saveData(save);
+  Audio_.setSuspended(true);
+});
+
+// Leaving the tab mid-run pauses the game instead of letting the jet crash unseen.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (Game.state === 'playing') {
+      Game.state = 'paused';
+      Game.pauseSource = 'user';
+    }
+    Platform.saveData(save);
+  }
+  Audio_.setSuspended(document.hidden || Game.state === 'paused');
 });
 Platform.onSystemResume(() => {
   // Wait for explicit tap-to-continue; system pause does not auto-resume.
@@ -1796,7 +2347,7 @@ function drawRadar() {
   for (const m of missilePool.active) {
     const dx = m.x - jet.x, dy = m.y - jet.y;
     if (Math.hypot(dx, dy) > RADAR_RANGE) continue;
-    ctx2d.fillStyle = '#E4453A';
+    ctx2d.fillStyle = m.kind === 'radar' ? '#FFC23D' : '#E4453A';
     ctx2d.beginPath();
     ctx2d.arc(cx + dx * scaleR, cy + dy * scaleR, 2.6, 0, Math.PI * 2);
     ctx2d.fill();
@@ -1933,7 +2484,7 @@ function drawHudButtons() {
 
   // wallet pill (below the three buttons, right aligned)
   const pillW = 64, pillH = 26;
-  const px = LOGICAL_W - 30 - pillW / 2, py = 40 + 34;
+  const px = VIEW_W - 30 - pillW / 2, py = 40 + 34;
   draw3DPill(px, py, pillW, pillH);
   drawBulletIcon(px - pillW / 2 + 16, py, 15);
   drawUprightText(String(save.bullets), px + 8, py + 1, 14, COLORS.white, 'center', true);
@@ -1997,28 +2548,32 @@ function drawPowerupIcon(id, x, y, affordable) {
     ctx2d.fill();
     ctx2d.restore();
   } else if (id === 'flares') {
-    // A small missile: grey body, green center band, red nose + fins.
+    // "Angel wings": burning flares arcing out and down from a central drop point.
     ctx2d.save();
-    ctx2d.translate(x, y);
-    ctx2d.rotate(-Math.PI / 4);
-    const bodyC = affordable ? '#D9D9D9' : COLORS.grey;
-    const bandC = affordable ? '#4C7A3D' : COLORS.grey;
-    const finC = affordable ? '#E8362B' : COLORS.grey;
-    ctx2d.fillStyle = bodyC;
-    roundRect(-3, -9, 6, 18, 2.5);
-    ctx2d.fill();
-    ctx2d.fillStyle = bandC;
-    ctx2d.fillRect(-3, -1.5, 6, 3.5);
-    ctx2d.fillStyle = finC;
-    ctx2d.beginPath();
-    ctx2d.moveTo(-3, -9); ctx2d.lineTo(3, -9); ctx2d.lineTo(0, -13);
-    ctx2d.closePath(); ctx2d.fill();
-    ctx2d.beginPath();
-    ctx2d.moveTo(-3, 4); ctx2d.lineTo(-8, 9); ctx2d.lineTo(-3, 9);
-    ctx2d.closePath(); ctx2d.fill();
-    ctx2d.beginPath();
-    ctx2d.moveTo(3, 4); ctx2d.lineTo(8, 9); ctx2d.lineTo(3, 9);
-    ctx2d.closePath(); ctx2d.fill();
+    ctx2d.translate(x, y - 6);
+    const trailC = affordable ? 'rgba(235,238,245,0.75)' : COLORS.grey;
+    const hotC = affordable ? '#FFE47A' : COLORS.grey;
+    const coreC = affordable ? '#FFFFFF' : COLORS.grey;
+    ctx2d.strokeStyle = trailC;
+    ctx2d.lineWidth = 1.6;
+    ctx2d.lineCap = 'round';
+    const tips = [];
+    for (const side of [-1, 1]) {
+      for (const k of [0, 1, 2]) {
+        const ex = side * (5 + k * 3.5), ey = 6 + k * 4;
+        ctx2d.beginPath();
+        ctx2d.moveTo(0, 0);
+        ctx2d.quadraticCurveTo(side * (6 + k * 4), -2 + k, ex, ey);
+        ctx2d.stroke();
+        tips.push([ex, ey]);
+      }
+    }
+    for (const [ex, ey] of tips) {
+      ctx2d.fillStyle = hotC;
+      ctx2d.beginPath(); ctx2d.arc(ex, ey, 2.6, 0, Math.PI * 2); ctx2d.fill();
+      ctx2d.fillStyle = coreC;
+      ctx2d.beginPath(); ctx2d.arc(ex, ey, 1.2, 0, Math.PI * 2); ctx2d.fill();
+    }
     ctx2d.restore();
   } else if (id === 'shield') {
     // Two-tone blue shield with a small white top-down plane silhouette.
@@ -2128,19 +2683,62 @@ function drawPowerupBar() {
       ctx2d.stroke();
       ctx2d.restore();
     }
+    // Time left on a running power-up, drawn as a draining ring.
+    const left = { boost: jet.boostTimer / JET_BOOST_DURATION, shield: jet.shieldTimer / SHIELD_DURATION, slowmo: jet.slowmoTimer / SLOWMO_DURATION }[b.id];
+    if (left > 0) {
+      ctx2d.save();
+      ctx2d.strokeStyle = COLORS.fuelFull;
+      ctx2d.lineWidth = 3.5;
+      ctx2d.lineCap = 'round';
+      ctx2d.beginPath();
+      ctx2d.arc(b.x, b.y, b.r + 3, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * left);
+      ctx2d.stroke();
+      ctx2d.restore();
+    }
     const badgeX = b.x + b.r * 0.68, badgeY = b.y - b.r * 0.68;
     ctx2d.fillStyle = affordable ? COLORS.orange : COLORS.grey;
     roundRect(badgeX - 15, badgeY - 8, 30, 16, 8);
     ctx2d.fill();
     drawBulletIcon(badgeX - 7, badgeY, 10);
-    drawUprightText(String(POWERUPS[b.id].cost), badgeX + 5, badgeY + 1, 10, COLORS.white, 'center', true);
-    drawUprightText(POWERUPS[b.id].label, b.x, b.y + b.r + 12, 10, COLORS.white, 'center', true);
+    drawUprightText(String(POWERUPS[b.id].cost), badgeX + 5, badgeY + 1, 11, COLORS.white, 'center', true);
+    const label = Input.usedKeyboard ? `${powerupButtons.indexOf(b) + 1} · ${POWERUPS[b.id].label}` : POWERUPS[b.id].label;
+    drawShadowedText(label, b.x, b.y + b.r + 12, 11, COLORS.white, 'rgba(5,11,31,0.6)', 1);
+  }
+}
+
+// Edge arrows for missiles that are still off-screen, so threats never appear from nowhere.
+function drawMissileIndicators() {
+  const hw = VIEW_W / 2, hh = VIEW_H / 2, inset = 22;
+  for (const m of missilePool.active) {
+    const dx = m.x - camera.x, dy = m.y - camera.y;
+    if (Math.abs(dx) < hw - 6 && Math.abs(dy) < hh - 6) continue;
+    const d = Math.hypot(dx, dy);
+    if (d > 1100) continue;
+    const t = Math.min((hw - inset) / Math.max(1e-6, Math.abs(dx)), (hh - inset) / Math.max(1e-6, Math.abs(dy)));
+    const x = hw + dx * t, y = hh + dy * t;
+    const a = Math.atan2(dy, dx);
+    ctx2d.save();
+    ctx2d.globalAlpha *= clamp(1.25 - d / 900, 0.35, 1);
+    ctx2d.translate(x, y);
+    ctx2d.rotate(a);
+    ctx2d.fillStyle = m.kind === 'radar' ? '#FFC23D' : '#FF5A4A';
+    ctx2d.strokeStyle = 'rgba(5,11,31,0.6)';
+    ctx2d.lineWidth = 1.5;
+    ctx2d.beginPath();
+    ctx2d.moveTo(9, 0);
+    ctx2d.lineTo(-6, -7);
+    ctx2d.lineTo(-3, 0);
+    ctx2d.lineTo(-6, 7);
+    ctx2d.closePath();
+    ctx2d.stroke();
+    ctx2d.fill();
+    ctx2d.restore();
   }
 }
 
 function drawChevrons() {
   if (Game.state !== 'playing') return;
-  const y = LOGICAL_H * 0.6;
+  const y = VIEW_H * 0.6;
   const leftOn = Input.steerLeftPointers.size > 0 || Input.keyLeft;
   const rightOn = Input.steerRightPointers.size > 0 || Input.keyRight;
   ctx2d.save();
@@ -2152,92 +2750,182 @@ function drawChevrons() {
   ctx2d.stroke();
   ctx2d.strokeStyle = `rgba(255,255,255,${rightOn ? 0.75 : 0.4})`;
   ctx2d.beginPath();
-  ctx2d.moveTo(LOGICAL_W - 26, y - 14); ctx2d.lineTo(LOGICAL_W - 14, y); ctx2d.lineTo(LOGICAL_W - 26, y + 14);
+  ctx2d.moveTo(VIEW_W - 26, y - 14); ctx2d.lineTo(VIEW_W - 14, y); ctx2d.lineTo(VIEW_W - 26, y + 14);
   ctx2d.stroke();
   ctx2d.restore();
 }
+
+// "LEVEL N" pops in with a little overshoot, holds, then fades.
+function drawLevelBanner() {
+  if (Game.levelBanner <= 0 || Game.state !== 'playing') return;
+  const shown = 2.4 - Game.levelBanner;
+  const k = easeOutBack(clamp(shown / 0.35, 0, 1));
+  const alpha = Math.min(1, Game.levelBanner / 0.5);
+  const y = Math.max(140, VIEW_H * 0.3);
+  ctx2d.save();
+  ctx2d.globalAlpha *= alpha;
+  ctx2d.translate(VIEW_W / 2, y);
+  ctx2d.scale(k, k);
+  drawShadowedText(`LEVEL ${Game.level}`, 0, 0, 34, '#FFD54A', 'rgba(5,11,31,0.7)', 2);
+  drawShadowedText(Game.levelMsg, 0, 30, 14, COLORS.white, 'rgba(5,11,31,0.7)', 1.5);
+  ctx2d.restore();
+}
+
+const hasFinePointer = !!(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
 
 function drawStartHint() {
   if (Game.startHintAlpha <= 0) return;
   ctx2d.save();
   ctx2d.globalAlpha = Game.startHintAlpha;
-  drawShadowedText('Tap left / right to steer', LOGICAL_W / 2, LOGICAL_H * 0.4, 18, COLORS.white, 'rgba(18,48,58,0.4)', 2);
+  drawShadowedText('Tap left / right to steer', VIEW_W / 2, VIEW_H * 0.4, 18, COLORS.white, 'rgba(18,48,58,0.4)', 2);
+  if (hasFinePointer) {
+    drawShadowedText('Keyboard: ← → to steer  ·  1-5 power-ups  ·  P pause', VIEW_W / 2, VIEW_H * 0.4 + 28, 13, 'rgba(255,255,255,0.85)', 'rgba(18,48,58,0.4)', 1);
+  }
   ctx2d.restore();
 }
 
-const PILL_FONT = 'bold 13px "Skyline Rounded", sans-serif';
-const PILL_PAD = 14;
-const PILL_ICON_W = 26; // wide enough for the diamond icon (~2x its size) without touching the text
-const PILL_H = 30;
+const BUBBLE_R = 40;
+const BUBBLE_TINTS = [
+  [120, 200, 255], // sky blue
+  [255, 150, 210], // pink
+  [140, 240, 200], // mint
+  [190, 165, 255], // lilac
+];
 
-function pillWidth(text, hasIcon) {
-  ctx2d.font = PILL_FONT;
-  return ctx2d.measureText(text).width + PILL_PAD * 2 + (hasIcon ? PILL_ICON_W : 0);
+function easeOutBack(t) {
+  const c = 1.9;
+  return 1 + (c + 1) * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2);
 }
 
-function pillChip(text, x, y, iconDraw, w) {
-  const h = PILL_H;
-  draw3DPill(x, y, w, h);
-  ctx2d.font = PILL_FONT;
-  const textW = ctx2d.measureText(text).width;
-  // Lay out left-to-right from the pill's own edge (using w directly) so
-  // this always matches pillWidth()'s formula, even after a row-wide shrink.
-  const contentLeft = x - w / 2 + PILL_PAD;
-  const textLeft = iconDraw ? contentLeft + PILL_ICON_W : contentLeft;
-  if (iconDraw) iconDraw(contentLeft + PILL_ICON_W / 2, y);
-  const tx = textLeft + textW / 2;
-  drawUprightText(text, tx, y + 1, 13, COLORS.white, 'center', true);
+// A see-through soap bubble: clear center, brighter Fresnel edge, a slowly
+// turning thin-film rim, and highlights from a single top-left light.
+function drawBubble(x, y, r, tint, spin) {
+  const [tr, tg, tb] = tint;
+  ctx2d.save();
+
+  const glow = ctx2d.createRadialGradient(x, y, r * 0.85, x, y, r * 1.35);
+  glow.addColorStop(0, `rgba(${tr},${tg},${tb},0.22)`);
+  glow.addColorStop(1, `rgba(${tr},${tg},${tb},0)`);
+  ctx2d.fillStyle = glow;
+  ctx2d.beginPath();
+  ctx2d.arc(x, y, r * 1.35, 0, Math.PI * 2);
+  ctx2d.fill();
+
+  const body = ctx2d.createRadialGradient(x - r * 0.25, y - r * 0.3, r * 0.1, x, y, r);
+  body.addColorStop(0, 'rgba(255,255,255,0.16)');
+  body.addColorStop(0.55, `rgba(${tr},${tg},${tb},0.07)`);
+  body.addColorStop(0.85, `rgba(${tr},${tg},${tb},0.18)`);
+  body.addColorStop(1, 'rgba(235,245,255,0.42)');
+  ctx2d.fillStyle = body;
+  ctx2d.beginPath();
+  ctx2d.arc(x, y, r, 0, Math.PI * 2);
+  ctx2d.fill();
+
+  let rim;
+  if (typeof ctx2d.createConicGradient === 'function') {
+    rim = ctx2d.createConicGradient(spin, x, y);
+    rim.addColorStop(0, 'rgba(255,156,230,0.85)');
+    rim.addColorStop(0.25, 'rgba(143,243,255,0.85)');
+    rim.addColorStop(0.5, 'rgba(255,243,160,0.8)');
+    rim.addColorStop(0.75, 'rgba(184,166,255,0.85)');
+    rim.addColorStop(1, 'rgba(255,156,230,0.85)');
+  } else {
+    rim = 'rgba(220,235,255,0.75)';
+  }
+  ctx2d.strokeStyle = rim;
+  ctx2d.lineWidth = 2;
+  ctx2d.beginPath();
+  ctx2d.arc(x, y, r - 1, 0, Math.PI * 2);
+  ctx2d.stroke();
+
+  ctx2d.lineCap = 'round';
+  ctx2d.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx2d.lineWidth = 3;
+  ctx2d.beginPath();
+  ctx2d.arc(x, y, r * 0.8, Math.PI * 1.08, Math.PI * 1.38);
+  ctx2d.stroke();
+
+  ctx2d.translate(x - r * 0.42, y - r * 0.45);
+  ctx2d.rotate(-0.75);
+  const spec = ctx2d.createRadialGradient(0, 0, 0, 0, 0, r * 0.22);
+  spec.addColorStop(0, 'rgba(255,255,255,0.9)');
+  spec.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx2d.fillStyle = spec;
+  ctx2d.scale(1, 0.5);
+  ctx2d.beginPath();
+  ctx2d.arc(0, 0, r * 0.22, 0, Math.PI * 2);
+  ctx2d.fill();
+  ctx2d.restore();
+
+  ctx2d.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx2d.beginPath();
+  ctx2d.arc(x + r * 0.32, y + r * 0.74, r * 0.055, 0, Math.PI * 2);
+  ctx2d.fill();
 }
 
-// Lays out a row of pill chips centered on cx, shrinking the gap (and, if
-// still too wide, the font) so a row never runs past the screen edges.
-function drawChipRow(chips, cx, y) {
-  const gap = 10;
-  let widths = chips.map((c) => pillWidth(c.text, !!c.icon));
-  let totalW = widths.reduce((a, b) => a + b, 0) + gap * (widths.length - 1);
-  const maxW = LOGICAL_W - 24;
-  if (totalW > maxW) {
-    const shrink = maxW / totalW;
-    widths = widths.map((w) => w * shrink);
-    totalW = maxW;
-  }
-  let cxStart = cx - totalW / 2;
-  for (let i = 0; i < chips.length; i++) {
-    const w = widths[i];
-    pillChip(chips[i].text, cxStart + w / 2, y, chips[i].icon, w);
-    cxStart += w + gap;
-  }
+function drawFittedText(text, x, y, size, maxW, color) {
+  ctx2d.font = `bold ${size}px "Skyline Rounded", "Arial Rounded MT Bold", sans-serif`;
+  const w = ctx2d.measureText(text).width;
+  const fitted = w > maxW ? Math.max(7, size * maxW / w) : size;
+  ctx2d.save();
+  ctx2d.shadowColor = 'rgba(5,11,31,0.75)';
+  ctx2d.shadowBlur = 4;
+  ctx2d.shadowOffsetY = 1;
+  drawUprightText(text, x, y, fitted, color, 'center', true);
+  ctx2d.restore();
+}
+
+// Four stat bubbles that inflate one after another, then drift gently.
+function drawStatBubbles(cx, y) {
+  const stats = [
+    { value: String(save.bullets), label: 'bullets', gem: true },
+    { value: String(Game.missilesDown), label: 'missiles down' },
+    { value: String(Game.closeCalls), label: 'close calls' },
+    { value: `${Math.floor(Game.elapsed)}s`, label: 'airborne' },
+  ];
+  const spacing = Math.min(BUBBLE_R * 2 + 14, (VIEW_W - 24 - BUBBLE_R * 2) / (stats.length - 1));
+  const startX = cx - spacing * (stats.length - 1) / 2;
+  const now = performance.now() / 1000;
+  stats.forEach((s, i) => {
+    const t = clamp((Game.overT - 0.25 - i * 0.12) / 0.45, 0, 1);
+    if (t <= 0) return;
+    const k = easeOutBack(t);
+    const bx = startX + i * spacing;
+    const by = y + Math.sin(now * 1.6 + i * 1.3) * 3 * t;
+    ctx2d.save();
+    ctx2d.globalAlpha *= Math.min(1, t * 1.6);
+    ctx2d.translate(bx, by);
+    ctx2d.scale(k, k);
+    drawBubble(0, 0, BUBBLE_R, BUBBLE_TINTS[i % BUBBLE_TINTS.length], now * 0.6 + i);
+    if (s.gem) drawBulletIcon(0, -BUBBLE_R * 0.47, 8);
+    drawFittedText(s.value, 0, s.gem ? 0 : -4, 22, BUBBLE_R * 1.4, COLORS.white);
+    drawFittedText(s.label, 0, BUBBLE_R * 0.42, 10, BUBBLE_R * 1.5, 'rgba(235,243,255,0.95)');
+    ctx2d.restore();
+  });
 }
 
 function drawGameOverScreen() {
-  const cx = LOGICAL_W / 2;
-  let y = LOGICAL_H * 0.28;
+  const cx = VIEW_W / 2;
+  // Dim the still-flying missiles so the see-through bubbles and text stay readable.
+  const scrim = ctx2d.createRadialGradient(cx, VIEW_H / 2, 0, cx, VIEW_H / 2, Math.max(VIEW_W, VIEW_H) * 0.7);
+  scrim.addColorStop(0, `rgba(5,11,31,${0.55 * Math.min(1, Game.overT / 0.4)})`);
+  scrim.addColorStop(1, `rgba(5,11,31,${0.3 * Math.min(1, Game.overT / 0.4)})`);
+  ctx2d.fillStyle = scrim;
+  ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  // The block is ~310 units tall; center it when the view is short (landscape).
+  let y = Math.min(VIEW_H * 0.28, VIEW_H / 2 - 150);
   const title = Game.deathReason === 'fuel' ? 'Out of fuel' : 'Shot down';
   drawShadowedText(title, cx, y, 24, COLORS.white, 'rgba(5,11,31,0.6)', 1.5);
   y += 70;
   drawShadowedText(String(Game.finalScore), cx, y, 72, COLORS.white, 'rgba(18,48,58,0.35)', 4);
-  y += 60;
-  const bulletIcon = (x, yy) => drawBulletIcon(x, yy, 10);
-  drawChipRow(
-    [
-      { text: `${save.bullets} bullets`, icon: bulletIcon },
-      { text: `${Game.missilesDown} missiles down`, icon: null },
-    ],
-    cx, y
-  );
-  y += 38;
-  drawChipRow(
-    [
-      { text: `${Game.closeCalls} close calls`, icon: null },
-      { text: `${Math.floor(Game.elapsed)} s airborne`, icon: null },
-    ],
-    cx, y
-  );
-  y += 46;
+  y += 88;
+  drawStatBubbles(cx, y);
+  y += 70;
   if (Game.newRecord) {
-    drawUprightText('New best score', cx, y, 15, COLORS.orange, 'center', true);
+    drawUprightText(`New best score  ·  Level ${Game.level}`, cx, y, 15, COLORS.orange, 'center', true);
   } else {
-    drawUprightText(`Best ${save.bestScore}`, cx, y, 15, COLORS.white, 'center', true);
+    drawUprightText(`Best ${save.bestScore}  ·  Level ${Game.level}`, cx, y, 15, COLORS.white, 'center', true);
   }
   y += 56;
   const btnW = 200, btnH = 52;
@@ -2249,7 +2937,7 @@ let gameOverButtonRect = null;
 
 let pauseButtonRect = null;
 function drawPauseScreen() {
-  const cx = LOGICAL_W / 2, cy = LOGICAL_H / 2;
+  const cx = VIEW_W / 2, cy = VIEW_H / 2;
   ctx2d.save();
   ctx2d.fillStyle = 'rgba(255,255,255,0.92)';
   roundRect(cx - 110, cy - 90, 220, 180, 22);
@@ -2268,18 +2956,23 @@ function drawDebug() {
   ctx2d.fillStyle = 'lime';
   ctx2d.font = '12px monospace';
   ctx2d.textAlign = 'left';
-  ctx2d.fillText(`FPS ${Game.fps}`, 6, LOGICAL_H - 8);
-  ctx2d.fillText(`missiles ${missilePool.active.length}/${missileCap}`, 6, LOGICAL_H - 22);
-  ctx2d.fillText(`particles ${particlePool.active.length}`, 6, LOGICAL_H - 36);
-  ctx2d.fillText(`bullets ${save.bullets} | fuel ${Math.round(jet.fuel)} (press G for +20/full)`, 6, LOGICAL_H - 50);
+  ctx2d.fillText(`FPS ${Game.fps}`, 6, VIEW_H - 8);
+  ctx2d.fillText(`missiles ${missilePool.active.length}/${missileCap}`, 6, VIEW_H - 22);
+  ctx2d.fillText(`particles ${particlePool.active.length}`, 6, VIEW_H - 36);
+  ctx2d.fillText(`bullets ${save.bullets} | fuel ${Math.round(jet.fuel)} (press G for +20/full)`, 6, VIEW_H - 50);
   ctx2d.restore();
 }
 
 function render() {
-  ctx2d.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
-  ctx2d.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+  ctx2d.setTransform(dpr * viewScale, 0, 0, dpr * viewScale, 0, 0);
+  ctx2d.clearRect(0, 0, VIEW_W, VIEW_H);
 
   drawSkyGradient();
+  ctx2d.save();
+  if (Game.shake > 0) {
+    const s = Game.shake * Game.shake * 7;
+    ctx2d.translate(rand(-s, s), rand(-s, s));
+  }
   drawStarfieldLayer(0.3, 90, 0.5, 1);
   drawStarfieldLayer(0.55, 130, 0.35, 300);
   drawPlanetLayer(0.6, 320, 30, 0.28, 700);
@@ -2292,40 +2985,53 @@ function render() {
     for (const s of bulletPool.active) drawBullet(s);
   }
   for (const m of missilePool.active) drawMissile(m);
-  for (const p of interceptorPool.active) drawInterceptor(p);
   drawJet();
   drawParticles();
+  for (const f of flarePool.active) drawFlare(f);
+  ctx2d.restore();
+
+  if (Game.danger > 0.02 && Game.state === 'playing') {
+    const pulse = 0.75 + 0.25 * Math.sin(performance.now() / 90);
+    const g = ctx2d.createRadialGradient(VIEW_W / 2, VIEW_H / 2, Math.min(VIEW_W, VIEW_H) * 0.35, VIEW_W / 2, VIEW_H / 2, Math.hypot(VIEW_W, VIEW_H) / 2);
+    g.addColorStop(0, 'rgba(228,69,58,0)');
+    g.addColorStop(1, `rgba(228,69,58,${0.32 * Game.danger * pulse})`);
+    ctx2d.fillStyle = g;
+    ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
+  }
 
   if (jet.flareFlash > 0) {
     ctx2d.fillStyle = `rgba(255,138,45,${jet.flareFlash * 0.45})`;
-    ctx2d.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
   }
   if (jet.slowmoTimer > 0) {
     ctx2d.fillStyle = 'rgba(62,143,208,0.15)';
-    ctx2d.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
   }
   if (Game.deathFlash > 0) {
     ctx2d.fillStyle = `rgba(255,255,255,${Game.deathFlash * 0.35})`;
-    ctx2d.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    ctx2d.fillRect(0, 0, VIEW_W, VIEW_H);
   }
 
   // Upright HUD pass
   ctx2d.save();
   ctx2d.globalAlpha = Game.hudAlpha;
   if (Game.state === 'playing' || Game.state === 'paused') {
+    drawMissileIndicators();
     drawRadar();
-    drawShadowedText(String(Math.floor(Game.displayScore)), LOGICAL_W / 2, 46, 30 * Game.scoreScale, COLORS.white, 'rgba(18,48,58,0.35)', 2);
-    drawFuelGauge(LOGICAL_W / 2, 70, 140, 16);
+    drawShadowedText(String(Math.floor(Game.displayScore)), VIEW_W / 2, 46, 30 * Game.scoreScale, COLORS.white, 'rgba(18,48,58,0.35)', 2);
+    drawFuelGauge(VIEW_W / 2, 70, 140, 16);
+    drawShadowedText(`LEVEL ${Game.level}`, VIEW_W / 2, 94, 12, 'rgba(255,255,255,0.9)', 'rgba(5,11,31,0.6)', 1);
     drawHudButtons();
     drawPowerupBar();
     drawChevrons();
+    drawLevelBanner();
   }
   ctx2d.restore();
 
   if (Game.state === 'hint') {
     drawRadar();
-    drawShadowedText('0', LOGICAL_W / 2, 46, 30, COLORS.white, 'rgba(18,48,58,0.35)', 2);
-    drawFuelGauge(LOGICAL_W / 2, 70, 140, 16);
+    drawShadowedText('0', VIEW_W / 2, 46, 30, COLORS.white, 'rgba(18,48,58,0.35)', 2);
+    drawFuelGauge(VIEW_W / 2, 70, 140, 16);
     drawHudButtons();
     drawPowerupBar();
     drawStartHint();
@@ -2366,12 +3072,14 @@ canvas.addEventListener('pointerdown', (e) => {
 function frame(now) {
   const dt = (now - lastTime) / 1000;
   lastTime = now;
+  Audio_.setSuspended(document.hidden || Game.state === 'paused');
   update(dt);
   render();
   requestAnimationFrame(frame);
 }
 
 async function boot() {
+  resize();
   const raw = await Platform.loadData();
   save = migrateSave(raw);
   Audio_.setMusicOn(save.musicOn);
